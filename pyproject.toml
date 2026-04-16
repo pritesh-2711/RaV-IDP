@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rav-idp"
+version = "0.1.0"
+description = "Reconstruction-as-Validation pipeline for intelligent document processing."
+requires-python = ">=3.11"
+dependencies = [
+    "Levenshtein>=0.25",
+    "docling>=2.0",
+    "imagehash>=4.3",
+    "numpy>=1.26",
+    "openai>=1.30",
+    "opencv-python-headless>=4.9",
+    "pandas>=2.0",
+    "pillow>=10.0",
+    "pyarrow>=23.0",
+    "pydantic>=2.0",
+    "pymupdf>=1.24",
+    "pytesseract>=0.3.10",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "remotezip>=0.12",
+    "scikit-image>=0.22",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["rav_idp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
