@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import cv2
 import fitz
 import numpy as np
+import torch
 from PIL import Image
 
 from .config import DEFAULT_DPI
@@ -26,27 +27,30 @@ _RAPIDOCR_INSTANCE: "_RapidOCRType | None" = None
 
 
 def _rapidocr_model_dir() -> Path:
-    """Return the directory where the RapidOCR torch model files live."""
+    """Return the directory where the RapidOCR ONNX model files live."""
     import rapidocr as _pkg
     return Path(_pkg.__file__).parent / "models"
 
 
 def get_rapidocr() -> "_RapidOCRType":
-    """Return a cached RapidOCR instance using the torch backend."""
+    """Return a cached RapidOCR instance.
+
+    Uses the ONNX backend with bundled models. The torch backend requires
+    separate .pth model files that are not distributed with the package.
+    """
     global _RAPIDOCR_INSTANCE
     if _RAPIDOCR_INSTANCE is None:
         from rapidocr import RapidOCR
         from rapidocr.inference_engine.base import EngineType
         model_dir = _rapidocr_model_dir()
         _RAPIDOCR_INSTANCE = RapidOCR(params={
-            "Det.engine_type": EngineType.TORCH,
-            "Cls.engine_type": EngineType.TORCH,
-            "Rec.engine_type": EngineType.TORCH,
-            "Det.model_path": str(model_dir / "ch_PP-OCRv4_det_mobile.pth"),
-            "Cls.model_path": str(model_dir / "ch_ptocr_mobile_v2.0_cls_mobile.pth"),
-            "Rec.model_path": str(model_dir / "ch_PP-OCRv4_rec_mobile.pth"),
+            "Det.engine_type": EngineType.ONNXRUNTIME,
+            "Cls.engine_type": EngineType.ONNXRUNTIME,
+            "Rec.engine_type": EngineType.ONNXRUNTIME,
+            "Det.model_path": str(model_dir / "ch_PP-OCRv4_det_infer.onnx"),
+            "Cls.model_path": str(model_dir / "ch_ppocr_mobile_v2.0_cls_infer.onnx"),
+            "Rec.model_path": str(model_dir / "ch_PP-OCRv4_rec_infer.onnx"),
             "Rec.rec_keys_path": str(model_dir / "ppocr_keys_v1.txt"),
-            "EngineConfig.torch.use_cuda": True,
         })
     return _RAPIDOCR_INSTANCE
 

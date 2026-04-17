@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from PIL import Image
+import pytest
 
+from rav_idp.components.comparators import table as table_comparator
 from rav_idp.components.comparators.image import compare_image
 from rav_idp.components.comparators.table import compare_table
 from rav_idp.components.comparators.text import compare_text
@@ -37,12 +39,13 @@ def test_image_identical_crop() -> None:
     assert result.component_scores["phash_similarity"] == 1.0
 
 
-def test_table_identical() -> None:
+def test_table_identical(monkeypatch: pytest.MonkeyPatch) -> None:
     image_bytes = pil_to_png_bytes(Image.new("RGB", (32, 32), "white"))
     region = DetectedRegion(region_id="0_0", entity_type=EntityType.TABLE, bbox=_bbox(), original_crop=image_bytes, raw_docling_record={}, page_index=0)
     reconstruction = TableReconstruction(
         rendered_image=image_bytes,
         structural_signature={"row_count": 0, "col_count": 0, "headers": [], "cells": []},
     )
+    monkeypatch.setattr(table_comparator, "rapidocr_image_to_text", lambda _: "")
     result = compare_table(reconstruction, region, 0.75)
     assert 0.0 <= result.fidelity_score <= 1.0

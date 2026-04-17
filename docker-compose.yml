@@ -1,0 +1,14 @@
+services:
+  rav-idp:
+    build: .
+    # data/ and artifacts/ are kept on your Windows host so datasets and
+    # results survive container restarts without needing to re-download.
+    volumes:
+      - ./data:/workspace/data
+      - ./artifacts:/workspace/artifacts
+    # Reads OPENAI_API_KEY and any other vars from .env in the repo root.
+    env_file:
+      - .env
+    # Keep stdin open so you can run an interactive shell.
+    stdin_open: true
+    tty: true

@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Reconstruction-as-Validation pipeline for intelligent document processing."
 requires-python = ">=3.11"
 dependencies = [
+    "apted>=1.0",
+    "beautifulsoup4>=4.12",
     "Levenshtein>=0.25",
     "docling>=2.0",
     "imagehash>=4.3",
@@ -22,8 +24,15 @@ dependencies = [
     "pytesseract>=0.3.10",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
+    "rapidocr>=3.4",
     "remotezip>=0.12",
     "scikit-image>=0.22",
+    "scipy>=1.11",
+    "onnxruntime>=1.18",
+    "timm>=1.0",
+    "torch>=2.4",
+    "torchvision>=0.19",
+    "transformers>=4.41",
 ]
 
 [project.optional-dependencies]

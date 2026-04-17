@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from rav_idp.evaluation.stage3a_tables import _cluster_positions, _derive_ground_truth
+from rav_idp.evaluation.stage3a_tables import _cluster_positions, _compute_teds, _derive_ground_truth, _gt_annotation_to_html
 
 
 def test_cluster_positions_groups_nearby_values() -> None:
@@ -26,7 +26,29 @@ def test_derive_ground_truth_from_cell_bboxes() -> None:
 
     gt = _derive_ground_truth(annotation)
 
-    assert gt.row_count == 2
+    assert gt.row_count == 1
+    assert gt.total_row_count == 2
+    assert gt.header_row_count == 1
     assert gt.col_count == 2
     assert gt.headers == ["H1", "H2"]
-    assert gt.cell_texts == ["H1", "H2", "A", "B"]
+    assert gt.cell_texts == ["A", "B"]
+
+
+def test_gt_annotation_to_html_keeps_td_attributes() -> None:
+    annotation = {
+        "html": {
+            "structure": {
+                "tokens": ["<thead>", "<tr>", "<td colspan=\"2\">", "</td>", "</tr>", "</thead>"]
+            },
+            "cells": [{"tokens": ["H", "1"]}],
+        }
+    }
+
+    html = _gt_annotation_to_html(annotation)
+
+    assert "<td colspan=\"2\">H1</td>" in html
+
+
+def test_compute_teds_proxy_identity() -> None:
+    html = "<table><thead><tr><td>A</td></tr></thead><tbody><tr><td>B</td></tr></tbody></table>"
+    assert _compute_teds(html, html) == 1.0
