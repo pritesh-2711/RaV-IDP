@@ -1,420 +1,490 @@
 # RaV-IDP Design Document
 
-Status as of April 2026. Use this as a reference for what is done and a
-checklist for what comes next.
+This document is the working design reference for the RaV-IDP system. I update it when the code direction changes so the design stays aligned with what the repository actually does.
+
+Status: April 2026
 
 ---
 
-## What the system does
+## What I am building
 
-RaV-IDP is an intelligent document processing pipeline that wraps around
-existing extraction tools and validates each extraction by reconstruction.
+RaV-IDP is an intelligent document extraction pipeline that does more than just read pixels. The goal is to:
 
-The core idea: after extracting an entity (table, image, text block) from a
-document, reconstruct a representation of it and compare that reconstruction
-against the original document region. If they match, the extraction is
-trustworthy. If they diverge, trigger a fallback extractor (GPT-4o vision)
-and try again.
+- separate layout first
+- process each detected region independently
+- extract structured or semantic content by entity type
+- validate extractions with reconstruction-based checks
+- preserve enough intermediate evidence that I can inspect failures visually
 
-The thing that makes this non-trivial: the comparator must always anchor
-against the original document crop, never against the extraction itself.
-Otherwise a wrong extraction that reconstructs cleanly will always pass. This
-is called the bootstrap constraint.
+The end goal is not only benchmark performance. The system should become a document extraction service that can later support a RAG workflow or an automation pipeline.
 
 ---
 
-## Architecture
+## Core design idea
 
-Eight components in sequence:
+The pipeline extracts an entity from a document region, reconstructs a representation of that entity, and compares the reconstruction against the original source region.
 
-```
+If the reconstruction agrees with the source crop, the extraction is treated as reliable.
+If the reconstruction diverges, a fallback extractor can be triggered and compared again.
+
+One hard rule governs the system:
+
+> Comparison must always anchor against the original document crop, never against the extraction itself.
+
+This is the bootstrap constraint. If it is violated, a bad extraction can reconstruct its own mistakes and still appear correct.
+
+---
+
+## Current architecture
+
+The pipeline is layout-first by design.
+
+```text
 Document
-  └─ 1. Layout Detector          (Docling)
-  └─ 2. Region Quality Classifier
-  └─ 3. Region Pre-processor
-  └─ 4. Entity Router            (Table / Image / Text / Formula / URL)
-  └─ 5. Entity Extractors
-  └─ 6. Reconstructors
-  └─ 7. Comparators              → fidelity score f ∈ [0,1]
-         ├─ f ≥ τ  → pass, attach score to record
-         └─ f < τ  → GPT-4o vision fallback → re-run comparator
-  └─ 8. Context Enricher
+  -> 1. Page Rendering
+  -> 2. Layout Detection
+  -> 3. Region Quality Classification
+  -> 4. Region Pre-processing
+  -> 5. Entity Routing
+  -> 6. Primary Extraction
+  -> 7. Reconstruction
+  -> 8. Fidelity Comparison
+       -> if low fidelity: fallback extraction + re-compare
+  -> 9. Context Enrichment
+  -> 10. Image Semantic Enrichment
+  -> 11. Final Entity Record
 ```
 
-Important architectural change made during implementation: layout detection
-(step 2) must run before quality classification and pre-processing, not after.
-The layout detector needs the raw document. Pre-processing is applied only
-to individual regions after they are detected. This change unblocked stage 3c.
+The most important architectural correction during implementation was this:
 
-### Fidelity formulas
+- layout detection runs before region quality classification and preprocessing
+- the full page is not classified or preprocessed before layout detection
+- only individual detected regions are preprocessed after layout separation
 
-Table:
-```
-# Current code path
+That ordering matches the logic of mixed-content documents much better, especially when text, images, tables, labels, and formulas coexist on the same page.
+
+---
+
+## How each stage works
+
+### 1. Page Rendering
+
+Each page is rendered into a stable image representation so the downstream region-level pipeline behaves consistently across PDFs and image inputs.
+
+### 2. Layout Detection
+
+Docling detects text regions, table regions, and picture regions. This step defines the fundamental unit of work for the rest of the pipeline.
+
+### 3. Region Quality Classification
+
+Each detected region is classified independently rather than treating the whole page as a single quality unit. Skew and sharpness heuristics decide whether a crop is clean, scanned-clean, or scanned-degraded.
+
+### 4. Region Pre-processing
+
+Preprocessing happens only after the crop type is known. For non-image regions, transformations such as deskewing, binarization, or CLAHE are applied depending on quality.
+
+### 5. Entity Routing
+
+Each region is routed into a type-specific path:
+
+- table
+- image
+- text
+- formula
+- url
+
+### 6. Primary Extraction
+
+The primary extractor depends on the region type:
+
+- tables: structured reconstruction from Docling table records
+- images: crop extraction from the document region
+- text-like regions: text extraction from the region record
+
+### 7. Reconstruction
+
+An independent proxy of the extracted content is reconstructed:
+
+- table -> rendered grid image + structural signature
+- image -> pHash + sharpness + caption adjacency signal
+- text -> re-OCR or PDF text stream
+
+### 8. Fidelity Comparison
+
+The reconstruction is compared against the source crop to compute a fidelity score.
+
+If the score falls below the threshold, GPT-4o fallback extraction can be triggered and compared again.
+
+### 9. Context Enrichment
+
+Nearby text and captions are attached so each extracted entity carries useful document context.
+
+### 10. Image Semantic Enrichment
+
+Semantic enrichment runs for image entities after fidelity validation when an API key is available. This matters for the service goal because image regions often need semantic descriptions, OCR text, and structured interpretation, not just pixel crops.
+
+### 11. Final Record
+
+Each region is packaged into a final entity record with:
+
+- entity type
+- bounding box
+- extracted content
+- fidelity score
+- low-confidence flag
+- context
+- provenance
+
+---
+
+## Fidelity formulas currently used
+
+These formulas describe the current code path, not a final paper-locked definition.
+
+### Table
+
+```text
 f = 0.5 * grid_match + 0.2 * (1 - CER_headers) + 0.3 * (1 - CER_cells)
-
-# Where:
-# grid_match = average of row-count and column-count agreement against
-# signals derived from the original crop.
-#
-# Note: this is the current implementation, not yet a settled final design
-# for the paper. The table comparator is still under active revision.
 ```
 
-Image:
-```
+`grid_match` is currently treated as agreement between extracted row/column structure and signals derived from the original crop.
+
+The table comparator is still under active revision. It runs, but it is not yet considered solved.
+
+### Image
+
+```text
 f = 0.6 * pHash_similarity + 0.3 * sharpness_ratio + 0.1 * caption_check
 ```
 
-Text:
-```
+This fidelity score measures extraction stability, not semantic usefulness. Image semantic enrichment is therefore treated as a separate layer on top of pixel-level fidelity.
+
+### Text
+
+```text
 f = max(0, 1 - CER)
 ```
 
-### Thresholds
-
-| Entity | Default τ |
-|--------|----------|
-| Table  | 0.75     |
-| Image  | 0.70     |
-| Text   | 0.85     |
+For evaluation, overlap-aware metrics are also used because dataset annotations do not always include every visible text fragment on the page.
 
 ---
 
-## Repository structure
+## Thresholds currently used
 
-```
+| Entity | Default threshold |
+|--------|-------------------|
+| Table  | 0.75 |
+| Image  | 0.70 |
+| Text   | 0.85 |
+
+These thresholds will likely evolve after more inspection-driven review on real documents.
+
+---
+
+## Repository map
+
+The system is organized like this:
+
+```text
 rav_idp/
-  cli.py                     entry point: run pipeline on a document
-  config.py                  settings via .env / environment variables
-  models.py                  all Pydantic models
-  pipeline.py                main orchestration: RaVIDPPipeline
-  utils.py                   RapidOCR singleton, image helpers, PDF helpers
+  cli.py
+  config.py
+  io.py
+  inspection.py
+  models.py
+  pipeline.py
+  utils.py
 
   components/
-    quality_classifier.py    skew + sharpness → QualityClass enum
-    layout_detector.py       Docling wrapper → DetectedRegion list
-    preprocessor.py          page-level image enhancement by quality class
-    region_preprocessor.py   region-level enhancement
+    layout_detector.py
     region_quality_classifier.py
-    entity_router.py         partition regions by EntityType
-    fallback_extractor.py    GPT-4o vision fallback
-    context_enricher.py      caption + neighbour text attachment
+    region_preprocessor.py
+    entity_router.py
+    context_enricher.py
+    image_enricher.py
+    fallback_extractor.py
 
     extractors/
-      table.py               Docling table cells → DataFrame → TableContent
-      image.py               PyMuPDF pixel extraction → ImageContent
-      text.py                text + URL extraction → TextContent
+      table.py
+      image.py
+      text.py
 
     reconstructors/
-      table.py               DataFrame → rendered grid image + structural signature
-      image.py               pHash + sharpness + caption check
-      text.py                re-OCR or PDF text stream
+      table.py
+      image.py
+      text.py
 
     comparators/
-      table.py               grid/count match + OCR text agreement → FidelityResult
-      image.py               pHash similarity + sharpness ratio → FidelityResult
-      text.py                Levenshtein CER → FidelityResult
+      table.py
+      image.py
+      text.py
 
   evaluation/
-    stage1_quality.py        PLACEHOLDER
-    stage2_layout.py         IMPLEMENTED — DocLayNet, grouped IoU precision/recall/F1
-    stage3a_tables.py        IMPLEMENTED — PubTabNet, TATR + OCR, GT CER + proxy TEDS
-    stage3b_images.py        PLACEHOLDER
-    stage3c_text.py          IMPLEMENTED — FUNSD, Tesseract OCR, CER + WER
-    stage4_fidelity.py       PLACEHOLDER
-    stage5_reextraction.py   PLACEHOLDER
-    stage6_endtoend.py       PLACEHOLDER
+    stage1_quality.py
+    stage2_layout.py
+    stage3a_tables.py
+    stage3b_images.py
+    stage3c_text.py
+    stage4_fidelity.py
+    stage5_reextraction.py
+    stage6_endtoend.py
 
   data/
-    registry.py              dataset specs with download sources
-    downloader.py            HTTP + HuggingFace download, archive extraction
-    cli.py                   `python -m rav_idp.data fetch <dataset>`
+    registry.py
+    downloader.py
+    cli.py
 ```
 
 ---
 
-## Dependencies
+## What changed recently
 
-The packaging metadata should include the full runtime stack used by the
-current evaluation codepaths. In particular, stage 3a requires the vision
-stack below in addition to the lighter-weight pipeline dependencies.
+### 1. Layout-first processing became explicit
 
-| Package | Used in | Why missing |
-|---------|---------|-------------|
-| `torch >= 2.4` | stage3a (TATR) | heavy runtime dependency |
-| `torchvision` | TATR (transformers dependency) | heavy runtime dependency |
-| `transformers` | stage3a TATR model loading | heavy runtime dependency |
-| `timm` | TATR backbone support | heavy runtime dependency |
-| `rapidocr` | utils.py, comparators/table.py | OCR backend |
-| `onnxruntime` | RapidOCR ONNX backend | OCR runtime |
-| `scipy` | comparator peak/valley detection, correlations | scientific runtime |
-| `beautifulsoup4` | proxy TEDS HTML parsing | benchmark runtime |
-| `apted` | proxy TEDS tree distance | benchmark runtime |
+Quality classification and preprocessing are no longer treated as page-level steps that happen before layout detection. Layout is detected first, and only then are the resulting regions processed.
 
-Install order still matters in practice on clean machines because the TATR
-stack pulls in large binary wheels.
+### 2. Always-on image semantics were added
+
+`ImageContent` was extended to store:
+
+- `image_type`
+- `description`
+- `extracted_text`
+- `structured_data`
+
+When `OPENAI_API_KEY` is available, images are enriched semantically after fidelity validation.
+
+### 3. Text evaluation was improved
+
+Overlap-aware metrics were added for Stage 3c because strict string-only evaluation was unfair when annotations excluded some visible text.
+
+### 4. An inspection-first pipeline mode was added
+
+A visual artifact recorder now allows an end-to-end document run to be inspected stage by stage through saved outputs instead of only through benchmark summaries.
+
+This is currently the most useful workflow for making decisions.
+
+---
+
+## Inspection-first run design
+
+When the CLI runs on a document, it creates a timestamped folder under:
+
+```text
+artifacts/pipeline_runs/<filename>_<datetime>/
+```
+
+Outputs are stored for each major stage:
+
+- `00_pages`
+- `01_layout`
+- `02_quality_classification`
+- `03_preprocessed_regions`
+- `04_rav_traces`
+- `05_final_output`
+
+### What gets saved in each folder
+
+#### `00_pages`
+
+The rendered page images are saved before any layout analysis.
+
+#### `01_layout`
+
+Page overlays with detected regions plus JSON metadata for each detected region are saved here.
+
+#### `02_quality_classification`
+
+Page overlays labeled with quality decisions are saved here, along with one folder per region containing the original crop.
+
+#### `03_preprocessed_regions`
+
+The original crop and processed crop for each region are saved here so preprocessing effects can be inspected directly.
+
+#### `04_rav_traces`
+
+For each region, this folder contains:
+
+- original crop
+- processed crop
+- primary extraction summary
+- fallback summary if triggered
+- reconstruction summary
+- fidelity scores
+- provenance
+
+For image and table regions, reconstructed visual artifacts are also saved where applicable.
+
+#### `05_final_output`
+
+This folder contains:
+
+- final page overlays
+- final `entity_records.json`
+- run summary
+
+This inspection layer is now central to how the system will be refined.
+
+---
+
+## Current implementation status
+
+### Stable enough to use now
+
+- end-to-end pipeline orchestration
+- layout-first region flow
+- region quality classification
+- region preprocessing
+- entity routing
+- text extraction path
+- image extraction path
+- context enrichment
+- image semantic enrichment when API key is available
+- visual pipeline inspection outputs
+
+### Implemented but still under revision
+
+- table extraction and table fidelity comparison
+- fidelity reliability study as a paper result
+- fallback recovery study as a paper result
+
+### Not yet the focus
+
+- full benchmark expansion
+- paper result population
+- arXiv LaTeX conversion
+
+---
+
+## Current evaluation picture
+
+Small real-data checks have already been run on the main extraction stages.
+
+### Stage 3a: tables
+
+The table benchmark path runs on real PubTabNet slices. It is technically operational, but row structure quality is still weak. Table improvements are intentionally not being prioritized right now.
+
+### Stage 3b: images
+
+The image benchmark runs on real ScanBank slices. Pixel-level extraction is stable, and semantic enrichment works when the API key is loaded from `experiment/.env`.
+
+### Stage 3c: text
+
+The text benchmark runs on real FUNSD slices. The evaluator now includes overlap-aware metrics, which better match the annotation-coverage objective.
+
+### End-to-end inspection path
+
+The pipeline has already run end to end on a sample local document image and produced a full timestamped inspection folder with stage outputs.
+
+Right now, that matters more than squeezing out another round of isolated benchmark numbers.
+
+---
+
+## How evaluation is treated now
+
+Component-wise evaluation still matters, but benchmark loops alone are no longer enough for design decisions.
+
+From this point forward, two complementary lenses guide the work:
+
+1. benchmark runs for coarse quantitative signals
+2. inspection-first pipeline runs for qualitative and architectural debugging
+
+If the benchmarks and the inspection folders disagree, the inspection evidence takes priority and the benchmark logic gets redesigned accordingly.
+
+---
+
+## Dependencies used
+
+The runtime stack currently depends on:
+
+- `docling`
+- `pymupdf`
+- `pydantic`
+- `opencv-python-headless`
+- `pillow`
+- `pytesseract`
+- `rapidocr`
+- `onnxruntime`
+- `pandas`
+- `numpy`
+- `scipy`
+- `torch`
+- `torchvision`
+- `transformers`
+- `timm`
+- `openai`
+- `python-dotenv`
+- `beautifulsoup4`
+- `apted`
+
+The packaging metadata has already been updated to include the missing heavy runtime pieces used by the newer evaluation and extraction paths.
+
+---
+
+## Stage-to-code map
+
+The following mapping connects paper stages to code:
+
+| Stage | Purpose | Primary code |
+|-------|---------|--------------|
+| 1 | Quality assessment | `rav_idp/evaluation/stage1_quality.py`, `rav_idp/components/region_quality_classifier.py` |
+| 2 | Layout detection | `rav_idp/evaluation/stage2_layout.py`, `rav_idp/components/layout_detector.py`, `rav_idp/components/page_renderer.py` |
+| 3a | Table extraction | `rav_idp/evaluation/stage3a_tables.py`, `rav_idp/components/extractors/table.py`, `rav_idp/components/reconstructors/table.py`, `rav_idp/components/comparators/table.py` |
+| 3b | Image extraction and semantics | `rav_idp/evaluation/stage3b_images.py`, `rav_idp/components/extractors/image.py`, `rav_idp/components/reconstructors/image.py`, `rav_idp/components/comparators/image.py`, `rav_idp/components/image_enricher.py` |
+| 3c | Text extraction | `rav_idp/evaluation/stage3c_text.py`, `rav_idp/components/extractors/text.py`, `rav_idp/components/reconstructors/text.py`, `rav_idp/components/comparators/text.py` |
+| 4 | Fidelity reliability study | `rav_idp/evaluation/stage4_fidelity.py` |
+| 5 | GPT fallback recovery study | `rav_idp/evaluation/stage5_reextraction.py`, `rav_idp/components/fallback_extractor.py`, `rav_idp/pipeline.py` |
+| 6 | End-to-end path | `rav_idp/evaluation/stage6_endtoend.py`, `rav_idp/pipeline.py` |
+
+---
+
+## Current priorities
+
+The project is intentionally shifting from “benchmark everything first” to “inspect real pipeline behavior first.”
+
+The next priorities are:
+
+1. run the inspection pipeline on real target documents
+2. review each stage folder manually
+3. refine image semantic output for downstream RAG and automation use
+4. refine text acceptance logic around annotation coverage and extra real text
+5. return to larger benchmark runs only after inspection shows me what to fix
+
+Table improvements are explicitly not being prioritized right now.
+
+---
+
+## How the pipeline runs now
 
 ```bash
-uv pip install torch==2.4.1+cpu torchvision==0.19.1+cpu \
-    --index-url https://download.pytorch.org/whl/cpu
-
-uv pip install "transformers>=5.0" "rapidocr>=1.3" "onnxruntime" "timm"
-
-uv pip install -e ".[dev]"
+cd /home/pritesh-jha/projects/rav-idp/experiment
+/home/pritesh-jha/projects/rav-idp/.venv/bin/python -m rav_idp.cli /path/to/document.pdf
 ```
 
----
-
-## Evaluation framework
-
-Six stages, each independently runnable. The principle: end-to-end
-benchmarks cannot isolate what a reconstruction-validation layer contributes.
-Each stage is paired with a dataset and metric appropriate to exactly what
-that component does.
-
-| Stage | Component | Dataset | Metric | Status |
-|-------|-----------|---------|--------|--------|
-| 1 | Document quality classifier | SmartDoc-QA | Accuracy per class | PLACEHOLDER |
-| 2 | Layout detector | DocLayNet | grouped IoU precision/recall/F1 | IMPLEMENTED |
-| 3a | Table extractor | PubTabNet | row/col accuracy, GT CER, fidelity, proxy TEDS | IMPLEMENTED |
-| 3b | Image extractor | ScanBank | IoU, caption match | PLACEHOLDER |
-| 3c | Text extractor | FUNSD | CER, WER, fidelity-CER correlation | IMPLEMENTED |
-| 4 | Fidelity scorer | PubTabNet (labelled subset) | Spearman ρ(fidelity, GT quality) | PLACEHOLDER |
-| 5 | Re-extraction fallback | PubTabNet failed set | recovery rate | PLACEHOLDER |
-| 6 | End-to-end | DocVQA | ANLS | PLACEHOLDER |
-
-Run an implemented stage:
-```bash
-# stage 3a — requires PubTabNet archive at data/raw/pubtabnet/pubtabnet.tar.gz
-python -m rav_idp.evaluation.stage3a_tables \
-    --dataset-root data/raw/pubtabnet \
-    --split val \
-    --limit 200 \
-    --output artifacts/stage3a_val.json
-
-# stage 3c — requires FUNSD parquet at data/raw/funsd/data/
-python -m rav_idp.evaluation.stage3c_text \
-    --dataset-root data/raw/funsd \
-    --split test \
-    --output artifacts/stage3c_test.json
-```
-
----
-
-## Stage-to-Code Map
-
-This is the current source-of-truth mapping from paper stage labels to the
-latest code paths in this repository.
-
-| Stage | Belongs to | Primary code | Current code status |
-|-------|------------|--------------|---------------------|
-| 1 | Document / region quality assessment | `rav_idp/evaluation/stage1_quality.py` plus `rav_idp/components/region_quality_classifier.py` | evaluation driver is placeholder; region classifier exists and is used by pipeline |
-| 2 | Layout detection | `rav_idp/evaluation/stage2_layout.py` plus `rav_idp/components/layout_detector.py` and `rav_idp/components/page_renderer.py` | implemented and runnable |
-| 3a | Table extraction on isolated table crops | `rav_idp/evaluation/stage3a_tables.py` plus `rav_idp/components/extractors/table.py`, `rav_idp/components/reconstructors/table.py`, `rav_idp/components/comparators/table.py` | implemented and runnable, but still under active revision |
-| 3b | Image extraction | `rav_idp/evaluation/stage3b_images.py` plus `rav_idp/components/extractors/image.py`, `rav_idp/components/reconstructors/image.py`, `rav_idp/components/comparators/image.py` | evaluation driver placeholder; component path exists |
-| 3c | Text extraction | `rav_idp/evaluation/stage3c_text.py` plus `rav_idp/components/extractors/text.py`, `rav_idp/components/reconstructors/text.py`, `rav_idp/components/comparators/text.py` | implemented and runnable |
-| 4 | Fidelity reliability study | `rav_idp/evaluation/stage4_fidelity.py` | placeholder; not implemented yet |
-| 5 | GPT fallback recovery study | `rav_idp/evaluation/stage5_reextraction.py` plus `rav_idp/components/fallback_extractor.py` and pipeline fallback logic in `rav_idp/pipeline.py` | fallback mechanism exists in pipeline; evaluation driver placeholder |
-| 6 | End-to-end question answering | `rav_idp/evaluation/stage6_endtoend.py` plus full `rav_idp/pipeline.py` stack | evaluation driver placeholder; dataset access also pending |
-
-Important interpretation notes:
-- Stage 3a is benchmark-only code for standalone table crops. It is not the
-  same as the production PDF pipeline path.
-- Stage 5 depends on both a meaningful fidelity gate and an available
-  `OPENAI_API_KEY`.
-- Stage 6 depends on dataset access in addition to implementation work.
-
----
-
-## Stage 3a: known issues and fixes applied
-
-Full details in `docs/fix_3a.md`. Summary:
-
-| Bug | File | Fix |
-|-----|------|-----|
-| Header/body row mismatch in GT counts | stage3a_tables.py | GT `row_count` aligned to extracted body rows |
-| Header cells double-counted in GT text | stage3a_tables.py | header cells removed from body-cell CER stream |
-| TATR extraction path unsuitable for isolated image crops when using Docling only | stage3a_tables.py | TATR primary, Docling fallback |
-| Comparator count bug / false pass risk | comparators/table.py | independent OCR/count parsing and stricter crop-anchored checks |
-| RapidOCR runtime instability on CPU / bundled models mismatch | utils.py | ONNX-backed RapidOCR singleton |
-
-Current status:
-- Stage 3a runs end to end on real PubTabNet crops.
-- Column recovery is noticeably stronger than row recovery.
-- The benchmark is now cleaner, but the table comparator and extraction path
-  are still not strong enough to treat Stage 3a as a solved result.
-- The TEDS value used in stage 3a is a benchmark-side proxy, not the official
-  PubTabNet TEDS implementation, because the predicted side is reconstructed
-  from a DataFrame and cannot encode merged cells exactly.
-
----
-
-## Paper status
-
-Written sections (in `Research papers/RaV-IDP/`):
-
-| File | Section | Status |
-|------|---------|--------|
-| 08_abstract_and_section1_introduction.md | Abstract + Section 1 | Written. Placeholders: [X]%, [ρ], [Z] ANLS in abstract. |
-| 07_section2_related_work.md | Section 2: Related Work | Written. |
-| 05_section3_problem_formulation.md | Section 3: Problem Formulation | Written. |
-| 06_section4_architecture.md | Section 4: Architecture | Written. |
-| — | Section 5: Evaluation Framework | Written inline in draft. |
-| — | Section 6: Results | PLACEHOLDER. Needs real numbers. |
-| — | Section 7: Limitations | Written. |
-| — | Section 8: Conclusion | Written. |
-
-The full draft is `RaV-IDP_draft.html` — arXiv-style HTML with MathJax,
-Georgia serif, 720px max-width. All 7 figures are embedded as relative paths
-to `figures/fig*.png`.
-
-The HTML is a readable intermediate. arXiv requires `.tex` source. Conversion
-to LaTeX has not been done yet.
-
----
-
-## What needs to happen next, in order
-
-### 1. Run stage 3c on real FUNSD data
-
-Stage 3c is already implemented and currently more stable than stage 3a.
-This is the fastest path to trustworthy paper numbers.
-
-### 2. Run stage 2 on DocLayNet
-
-The layout benchmark is implemented and already gives strong signals about
-where the architecture helps.
-
-### 3. Improve stage 3a until the fidelity signal is usable
-
-Real PubTabNet runs are already possible, but current results indicate that
-table fidelity is not yet reliable enough to anchor Stage 4 cleanly.
-
-### 4. Run stage 3a on larger real PubTabNet subsets
-
-After the stage 3a debugging pass, rerun on larger validation subsets for
-paper-quality numbers. PubTabNet is 11 GB; the val split has ~10,000 samples.
+For only the final JSON and no inspection artifacts:
 
 ```bash
-python -m rav_idp.data fetch pubtabnet     # downloads ~11 GB
-python -m rav_idp.evaluation.stage3a_tables \
-    --dataset-root data/raw/pubtabnet \
-    --split val \
-    --limit 500 \
-    --output artifacts/stage3a_val_500.json
-```
-
-Target metrics for the paper: row_accuracy, col_accuracy,
-exact_shape_accuracy, mean_cell_text_cer, mean_fidelity, pass_rate.
-
-### 2. Run stage 3c on real FUNSD data
-
-Stage 3c is implemented and passed end-to-end. Needs a full run to get
-reportable numbers.
-
-```bash
-python -m rav_idp.data fetch funsd
-python -m rav_idp.evaluation.stage3c_text \
-    --dataset-root data/raw/funsd \
-    --split test \
-    --output artifacts/stage3c_test.json
-```
-
-Target metric: mean_CER, mean_fidelity, fidelity_cer_correlation (Pearson).
-
-### 3. Implement stage 4: fidelity score validation
-
-This is the central empirical claim of the paper: fidelity scores correlate
-with ground-truth extraction quality. Without this, the paper has no
-empirical foundation for the core claim.
-
-Implementation plan:
-- Use PubTabNet labelled val set where GT cell text is known
-- For each sample, compute RaV fidelity score
-- Compute actual extraction quality (CER against GT cells)
-- Report Spearman ρ between fidelity and (1 - CER)
-
-The abstract currently has `[ρ]` as a placeholder for this number.
-
-### 4. Implement stage 5: re-extraction recovery rate
-
-Measures how many failed extractions (fidelity < τ) are recovered by the
-GPT-4o fallback. This maps to abstract placeholder `[X]%`.
-
-Requires: OpenAI API key, a set of failed stage 3a samples.
-
-### 5. Implement stage 2: layout detection evaluation on DocLayNet
-
-Stage 2 code exists (293 lines). Run it against DocLayNet and report mAP.
-
-```bash
-python -m rav_idp.data fetch doclaynet
-python -m rav_idp.evaluation.stage2_layout \
-    --dataset-root data/raw/doclaynet \
-    --output artifacts/stage2.json
-```
-
-### 6. Implement stage 6: end-to-end DocVQA
-
-Maps to abstract placeholder `[Z] ANLS`. DocVQA requires registration at
-docvqa.org. Once obtained:
-
-```bash
-python -m rav_idp.data stage --key docvqa --path /path/to/docvqa
-python -m rav_idp.evaluation.stage6_endtoend \
-    --dataset-root data/raw/docvqa \
-    --output artifacts/stage6.json
-```
-
-### 7. Populate Section 6 with actual numbers
-
-Once stages 3a, 3c, 4, 5 have results, fill in Section 6 in the HTML draft
-and replace the three abstract placeholders.
-
-### 8. Convert HTML draft to LaTeX for arXiv submission
-
-arXiv requires `.tex` source. The HTML draft is a readable intermediate only.
-Suggested approach: convert section-by-section, using the existing HTML as
-the authoritative source for text content. MathJax equations need to be
-converted back to raw LaTeX.
-
-### 9. Fix pyproject.toml
-
-Add the missing dependencies so `pip install -e .` covers everything:
-
-```toml
-"torch>=2.4",
-"torchvision",
-"transformers>=5.0",
-"timm",
-"rapidocr>=1.3",
-"onnxruntime",
+/home/pritesh-jha/projects/rav-idp/.venv/bin/python -m rav_idp.cli /path/to/document.pdf --no-visuals
 ```
 
 ---
 
-## Key design decisions on record
+## Main open questions
 
-**Why reconstruction validates extraction:** If an extraction is faithful to
-the source, rendering it back should produce something close to the original
-region. The divergence between rendered and original is a grounded,
-label-free quality signal.
+- How should image semantics be packaged so they are genuinely useful for retrieval and automation?
+- How should text extraction be scored when the model finds real text that the annotator chose not to label?
+- How should table structure validation eventually be redesigned so it penalizes structural failure more honestly?
+- Which fidelity thresholds should be used for routing decisions in production?
 
-**Why the comparator must anchor against the original crop:** Anchoring
-against the extraction makes the validation circular. A wrong extraction that
-reconstructs cleanly always passes. The original crop is stored at layout
-detection time and never modified.
+---
 
-**Why per-stage evaluation rather than end-to-end only:** End-to-end
-benchmarks like DocVQA mask component-level failures. A validation layer
-that improves table extraction may show no improvement on DocVQA if the
-question set does not exercise those tables. Per-stage evaluation is itself
-a methodological contribution.
+## Design conclusion
 
-**Why GPT-4o as the fallback extractor:** The fallback operates on the
-unmodified source crop with structured JSON prompts. It is entity-aware:
-table prompts request headers/rows/notes; image prompts request
-type/description/key_data_points; text prompts request plain transcription.
-The RaV loop repeats on fallback output to provide a second fidelity
-measurement.
+At this stage, RaV-IDP is more than a benchmark project. It already has a working end-to-end system with a visual inspection trail, and that gives a much stronger basis for improving the service than isolated metric loops alone.
+
+The near-term design strategy is simple:
+
+- keep the pipeline modular
+- inspect every stage visually
+- improve the regions that matter for real documents
+- use benchmarks to confirm progress, not to guess what the architecture should be

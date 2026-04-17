@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import tarfile
 import tempfile
 from dataclasses import asdict, dataclass
@@ -15,7 +16,7 @@ import pytesseract
 import torch
 import pandas as pd
 from Levenshtein import distance as lev_distance
-from PIL import Image
+from PIL import Image, ImageOps
 from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 
 from ..components.comparators.table import compare_table
@@ -38,16 +39,31 @@ except ImportError:  # pragma: no cover - optional dependency in tests
 _TATR_MODEL: Optional[TableTransformerForObjectDetection] = None
 _TATR_PROCESSOR: Optional[AutoImageProcessor] = None
 _TATR_MODEL_NAME = "microsoft/table-transformer-structure-recognition"
-_TATR_MIN_IMAGE_DIM = 400   # pixels; upscale smaller images before TATR
-_TATR_CELL_MIN_HEIGHT = 30  # pixels; upscale small cell crops before Tesseract
+_TATR_MIN_IMAGE_DIM = 640   # pixels; upscale smaller images before TATR
+_TATR_CELL_MIN_HEIGHT = 36  # pixels; upscale small cell crops before Tesseract
 _TATR_THRESHOLD = 0.5       # detection confidence threshold
+
+
+def _resolve_tatr_source() -> str:
+    cache_root = Path.home() / ".cache" / "huggingface" / "hub"
+    snapshot_root = cache_root / "models--microsoft--table-transformer-structure-recognition" / "snapshots"
+    if snapshot_root.exists():
+        snapshots = sorted((path for path in snapshot_root.iterdir() if path.is_dir()), key=os.path.getmtime, reverse=True)
+        for snapshot in snapshots:
+            if (snapshot / "preprocessor_config.json").exists() and (
+                (snapshot / "model.safetensors").exists() or (snapshot / "pytorch_model.bin").exists()
+            ):
+                return str(snapshot)
+    return _TATR_MODEL_NAME
 
 
 def _load_tatr() -> tuple[TableTransformerForObjectDetection, AutoImageProcessor]:
     global _TATR_MODEL, _TATR_PROCESSOR
     if _TATR_MODEL is None:
-        _TATR_PROCESSOR = AutoImageProcessor.from_pretrained(_TATR_MODEL_NAME)
-        _TATR_MODEL = TableTransformerForObjectDetection.from_pretrained(_TATR_MODEL_NAME)
+        model_source = _resolve_tatr_source()
+        local_only = model_source != _TATR_MODEL_NAME
+        _TATR_PROCESSOR = AutoImageProcessor.from_pretrained(model_source, local_files_only=local_only)
+        _TATR_MODEL = TableTransformerForObjectDetection.from_pretrained(model_source, local_files_only=local_only)
         _TATR_MODEL.eval()
         if torch.cuda.is_available():
             _TATR_MODEL = _TATR_MODEL.cuda()
@@ -71,6 +87,50 @@ def _ocr_cell(cell_crop: Image.Image) -> str:
     return pytesseract.image_to_string(cell_crop, config="--psm 6 --oem 3").strip()
 
 
+def _edge_dark_ratio(gray: Image.Image, edge: str, thickness: int = 8) -> float:
+    w, h = gray.size
+    thickness = max(1, min(thickness, w, h))
+    if edge == "bottom":
+        strip = gray.crop((0, h - thickness, w, h))
+    elif edge == "top":
+        strip = gray.crop((0, 0, w, thickness))
+    elif edge == "left":
+        strip = gray.crop((0, 0, thickness, h))
+    else:
+        strip = gray.crop((w - thickness, 0, w, h))
+    arr = torch.tensor(list(strip.getdata()), dtype=torch.float32)
+    if arr.numel() == 0:
+        return 0.0
+    return float((255.0 - arr).mean().item() / 255.0)
+
+
+def _pad_table_image(image: Image.Image) -> Image.Image:
+    """Pad the table crop so border-adjacent text survives structure detection.
+
+    This particularly helps when the last row sits very close to the lower
+    crop edge and TATR truncates its row band.
+    """
+    gray = image.convert("L")
+    w, h = image.size
+    base_pad = max(8, int(round(min(w, h) * 0.03)))
+    pads = {"left": base_pad, "top": base_pad, "right": base_pad, "bottom": base_pad}
+
+    if _edge_dark_ratio(gray, "bottom") > 0.10:
+        pads["bottom"] += max(10, int(round(h * 0.06)))
+    if _edge_dark_ratio(gray, "top") > 0.10:
+        pads["top"] += max(6, int(round(h * 0.03)))
+    if _edge_dark_ratio(gray, "left") > 0.10:
+        pads["left"] += max(6, int(round(w * 0.03)))
+    if _edge_dark_ratio(gray, "right") > 0.10:
+        pads["right"] += max(6, int(round(w * 0.03)))
+
+    return ImageOps.expand(
+        image,
+        border=(pads["left"], pads["top"], pads["right"], pads["bottom"]),
+        fill="white",
+    )
+
+
 def _tatr_table_record(image_bytes: bytes) -> dict:
     """Use TableTransformer structure recognition + Tesseract OCR to produce a
     Docling-compatible table record from a standalone table image crop.
@@ -82,6 +142,7 @@ def _tatr_table_record(image_bytes: bytes) -> dict:
     """
     model, processor = _load_tatr()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = _pad_table_image(image)
     image = _upscale_image(image, _TATR_MIN_IMAGE_DIM)
     w, h = image.size
 
@@ -133,7 +194,7 @@ def _tatr_table_record(image_bytes: bytes) -> dict:
             cell_y0 = max(ry0, cy0)
             cell_x1 = min(rx1, cx1)
             cell_y1 = min(ry1, cy1)
-            if cell_x1 - cell_x0 < 2 or cell_y1 - cell_y0 < 2:
+            if cell_x1 - cell_x0 < 1 or cell_y1 - cell_y0 < 1:
                 continue
             cell_crop = image.crop((int(cell_x0), int(cell_y0), int(cell_x1), int(cell_y1)))
             cell_text = _ocr_cell(cell_crop)

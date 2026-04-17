@@ -57,6 +57,103 @@ def _ocr_extract(image_bytes: bytes, config: str = "--psm 11") -> str:
     return _normalize_text(pytesseract.image_to_string(image, config=config))
 
 
+def _bbox_iou(a: list[float], b: list[float]) -> float:
+    inter_x0 = max(a[0], b[0])
+    inter_y0 = max(a[1], b[1])
+    inter_x1 = min(a[2], b[2])
+    inter_y1 = min(a[3], b[3])
+    if inter_x1 <= inter_x0 or inter_y1 <= inter_y0:
+        return 0.0
+    inter = (inter_x1 - inter_x0) * (inter_y1 - inter_y0)
+    area_a = max(0.0, (a[2] - a[0]) * (a[3] - a[1]))
+    area_b = max(0.0, (b[2] - b[0]) * (b[3] - b[1]))
+    denom = area_a + area_b - inter
+    return inter / denom if denom > 0 else 0.0
+
+
+def _gt_coverage(predicted: list[float], gt: list[float]) -> float:
+    inter_x0 = max(predicted[0], gt[0])
+    inter_y0 = max(predicted[1], gt[1])
+    inter_x1 = min(predicted[2], gt[2])
+    inter_y1 = min(predicted[3], gt[3])
+    if inter_x1 <= inter_x0 or inter_y1 <= inter_y0:
+        return 0.0
+    inter = (inter_x1 - inter_x0) * (inter_y1 - inter_y0)
+    gt_area = max(0.0, (gt[2] - gt[0]) * (gt[3] - gt[1]))
+    return inter / gt_area if gt_area > 0 else 0.0
+
+
+def _matches_gt(pred_box: list[float], gt_box: list[float], min_iou: float = 0.1, min_gt_cover: float = 0.5) -> bool:
+    return _bbox_iou(pred_box, gt_box) >= min_iou or _gt_coverage(pred_box, gt_box) >= min_gt_cover
+
+
+def _ocr_detect_boxes(image_bytes: bytes) -> list[list[float]]:
+    """Detect OCR word boxes on the full image for overlap-aware evaluation.
+
+    This is used as a complementary metric to answer:
+    "Did OCR find the annotated text regions?"
+    rather than forcing a page-level text string match against incomplete
+    annotations.
+    """
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config="--psm 11")
+    boxes: list[list[float]] = []
+    n = len(data.get("text", []))
+    for i in range(n):
+        text = (data["text"][i] or "").strip()
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1.0
+        if not text or conf < 0:
+            continue
+        x = int(data["left"][i])
+        y = int(data["top"][i])
+        w = int(data["width"][i])
+        h = int(data["height"][i])
+        if w <= 0 or h <= 0:
+            continue
+        boxes.append([x, y, x + w, y + h])
+    return boxes
+
+
+def _overlap_metrics(pred_boxes: list[list[float]], gt_boxes: list[list[float]]) -> tuple[float, float, float]:
+    if not gt_boxes:
+        return 0.0, 0.0, 0.0
+    gt_hits = sum(any(_matches_gt(pred, gt) for pred in pred_boxes) for gt in gt_boxes)
+    pred_hits = sum(any(_matches_gt(pred, gt) for gt in gt_boxes) for pred in pred_boxes)
+    recall = gt_hits / len(gt_boxes) if gt_boxes else 0.0
+    precision = pred_hits / len(pred_boxes) if pred_boxes else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return precision, recall, f1
+
+
+def _ocr_gt_regions(image_bytes: bytes, bboxes: list) -> str:
+    """OCR only the word-level crops defined by GT bounding boxes.
+
+    FUNSD ground-truth annotations cover form-field text only. Text outside
+    these boxes (figure captions, axis labels, etc.) is intentionally excluded
+    so that OCR false-positives from unannotated regions do not inflate CER/WER.
+
+    Each crop is run with psm=8 (single-word mode). Empty results are skipped.
+    """
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    width, height = image.size
+    texts = []
+    for bbox in bboxes:
+        x0, y0, x1, y1 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+        # clamp to image bounds
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(width, x1), min(height, y1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        crop = image.crop((x0, y0, x1, y1))
+        text = _normalize_text(pytesseract.image_to_string(crop, config="--psm 8"))
+        if text:
+            texts.append(text)
+    return _normalize_text(" ".join(texts))
+
+
 def _ground_truth_text(words: list[str] | tuple[str, ...]) -> str:
     return _normalize_text(" ".join(str(word) for word in words))
 
@@ -87,6 +184,9 @@ class TextBenchmarkRecord:
     reocr_text: str
     cer: float
     wer: float
+    overlap_precision: float
+    overlap_recall: float
+    overlap_f1: float
     fidelity_score: float
     passed_threshold: bool
 
@@ -98,6 +198,9 @@ class TextBenchmarkSummary:
     mean_cer: float
     median_cer: float
     mean_wer: float
+    mean_overlap_precision: float
+    mean_overlap_recall: float
+    mean_overlap_f1: float
     mean_fidelity: float
     pass_rate: float
     fidelity_cer_correlation: float
@@ -134,7 +237,18 @@ def run_text_benchmark(
     for row in frame.itertuples(index=False):
         ground_truth = _ground_truth_text(list(row.words))
         region = preprocess_region(classify_region(_make_region(str(row.id), row.image, "")))
-        extracted_text = _ocr_extract(region.processed_crop or region.original_crop, config="--psm 11")
+
+        # Use GT bounding boxes to restrict OCR to annotated regions only.
+        # This avoids penalising the extractor for text outside FUNSD annotations
+        # (captions, axis labels, figure text) that the GT does not cover.
+        raw_image_bytes = region.processed_crop or region.original_crop
+        gt_bboxes = list(row.bboxes) if hasattr(row, "bboxes") else []
+        pred_boxes = _ocr_detect_boxes(raw_image_bytes)
+        overlap_precision, overlap_recall, overlap_f1 = _overlap_metrics(pred_boxes, gt_bboxes)
+        if gt_bboxes:
+            extracted_text = _ocr_gt_regions(raw_image_bytes, gt_bboxes)
+        else:
+            extracted_text = _ocr_extract(raw_image_bytes, config="--psm 11")
         region = region.model_copy(update={"raw_docling_record": {"text": extracted_text}})
         entity = extract_text(region)
         reconstruction = reconstruct_text(
@@ -161,6 +275,9 @@ def run_text_benchmark(
                 reocr_text=reconstruction.content.reocr_text,
                 cer=cer,
                 wer=wer,
+                overlap_precision=overlap_precision,
+                overlap_recall=overlap_recall,
+                overlap_f1=overlap_f1,
                 fidelity_score=fidelity.fidelity_score,
                 passed_threshold=fidelity.passed_threshold,
             )
@@ -168,6 +285,9 @@ def run_text_benchmark(
 
     mean_cer = sum(record.cer for record in records) / len(records)
     mean_wer = sum(record.wer for record in records) / len(records)
+    mean_overlap_precision = sum(record.overlap_precision for record in records) / len(records)
+    mean_overlap_recall = sum(record.overlap_recall for record in records) / len(records)
+    mean_overlap_f1 = sum(record.overlap_f1 for record in records) / len(records)
     mean_fidelity = sum(record.fidelity_score for record in records) / len(records)
     median_cer = sorted(record.cer for record in records)[len(records) // 2]
     pass_rate = sum(1 for record in records if record.passed_threshold) / len(records)
@@ -177,6 +297,9 @@ def run_text_benchmark(
         mean_cer=mean_cer,
         median_cer=median_cer,
         mean_wer=mean_wer,
+        mean_overlap_precision=mean_overlap_precision,
+        mean_overlap_recall=mean_overlap_recall,
+        mean_overlap_f1=mean_overlap_f1,
         mean_fidelity=mean_fidelity,
         pass_rate=pass_rate,
         fidelity_cer_correlation=_pearson(

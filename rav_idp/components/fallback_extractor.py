@@ -39,9 +39,11 @@ USER_PROMPTS = {
     ),
     EntityType.IMAGE: (
         'Describe this figure. Return JSON with exactly these keys:\n'
-        '  "type": one of: bar_chart, pie_chart, line_chart, scatter_plot, box_plot, photograph, flowchart, diagram, table, other\n'
+        '  "type": one of: photograph, chart, diagram, flowchart, logo, screenshot, table_as_image, other\n'
         '  "description": concise factual description\n'
+        '  "extracted_text": all text visible within the image as a single string; empty string if none\n'
         '  "key_data_points": list of important numerical or categorical values visible in the image\n'
+        '  "structured_data": for chart or diagram types only — object with keys "title", "axes", "data_points", "trend"; null for all other types\n'
         '  "document_intent": one sentence — what this figure illustrates in the context of the document\n\n'
         "Surrounding document context:\n{context}"
     ),
@@ -88,11 +90,20 @@ def _parse_fallback_response(payload: dict, region: DetectedRegion) -> Extracted
                 ],
             )
         ).strip()
+        extracted_text = payload.get("extracted_text") or None
+        if isinstance(extracted_text, str) and not extracted_text.strip():
+            extracted_text = None
+        structured_data = payload.get("structured_data") or None
+        if isinstance(structured_data, dict) and not any(structured_data.values()):
+            structured_data = None
         content = ImageContent(
             crop_bytes=region.original_crop,
             classification_label=payload.get("type"),
             classification_confidence=None,
+            image_type=payload.get("type"),
             description=description or None,
+            extracted_text=extracted_text,
+            structured_data=structured_data,
         )
     else:
         content = TextContent(text=payload["text"], urls=[])

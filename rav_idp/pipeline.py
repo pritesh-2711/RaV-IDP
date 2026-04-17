@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from .components.comparators.image import compare_image
+from .components.image_enricher import enrich_image
 from .components.comparators.table import compare_table
 from .components.comparators.text import compare_text
 from .components.context_enricher import enrich_context
@@ -23,6 +24,7 @@ from .components.reconstructors.image import reconstruct_image
 from .components.reconstructors.table import reconstruct_table
 from .components.reconstructors.text import reconstruct_text
 from .config import get_settings
+from .inspection import VisualArtifactRecorder
 from .models import (
     ContextRecord,
     DetectedRegion,
@@ -30,6 +32,7 @@ from .models import (
     EntityType,
     ExtractedEntity,
     FidelityResult,
+    PipelineTraceRecord,
     ProvenanceRecord,
 )
 from .utils import is_native_pdf
@@ -108,7 +111,7 @@ class RaVIDPPipeline:
         region: DetectedRegion,
         page_regions: list[DetectedRegion],
         document_path: str | Path,
-    ) -> tuple[ExtractedEntity, FidelityResult, ProvenanceRecord]:
+    ) -> PipelineTraceRecord:
         """Run primary extraction and fallback when needed."""
 
         bundle = self.bundles[region.entity_type]
@@ -116,6 +119,7 @@ class RaVIDPPipeline:
         entity = bundle.extractor(region, **extra_kwargs["extractor"])
         reconstruction = bundle.reconstructor(entity, region, **extra_kwargs["reconstructor"])
         fidelity = self._compare(bundle, region, entity, reconstruction, "primary")
+        context_text = None
         provenance = ProvenanceRecord(
             region_id=region.region_id,
             primary_fidelity=fidelity.fidelity_score,
@@ -125,9 +129,19 @@ class RaVIDPPipeline:
         )
 
         if fidelity.passed_threshold:
-            return entity, fidelity, provenance
+            return PipelineTraceRecord(
+                region_id=region.region_id,
+                entity_type=region.entity_type,
+                primary_entity=entity,
+                primary_reconstruction=reconstruction,
+                primary_fidelity=fidelity,
+                final_entity=entity,
+                final_fidelity=fidelity,
+                provenance=provenance,
+            )
 
         fallback_context = self._context_text(region, page_regions)
+        context_text = fallback_context
         fallback_entity = call_vision_fallback(region, context_text=fallback_context)
         fallback_reconstruction = bundle.reconstructor(
             fallback_entity,
@@ -151,7 +165,20 @@ class RaVIDPPipeline:
             final_fidelity=best_fidelity.fidelity_score,
             low_confidence_flag=not best_fidelity.passed_threshold,
         )
-        return best_entity, best_fidelity, provenance
+        return PipelineTraceRecord(
+            region_id=region.region_id,
+            entity_type=region.entity_type,
+            primary_entity=entity,
+            primary_reconstruction=reconstruction,
+            primary_fidelity=fidelity,
+            fallback_entity=fallback_entity,
+            fallback_reconstruction=fallback_reconstruction,
+            fallback_fidelity=fallback_fidelity,
+            final_entity=best_entity,
+            final_fidelity=best_fidelity,
+            provenance=provenance,
+            context_text=context_text,
+        )
 
     def _bundle_kwargs(
         self,
@@ -193,30 +220,59 @@ class RaVIDPPipeline:
         result.extractor_name = extractor_name
         return result
 
-    def run(self, document_path: str | Path) -> list[EntityRecord]:
+    def run(
+        self,
+        document_path: str | Path,
+        artifact_recorder: VisualArtifactRecorder | None = None,
+    ) -> list[EntityRecord]:
         """Run the full pipeline and return final entity records."""
 
         page_records = render_document_pages(document_path)
+        if artifact_recorder:
+            artifact_recorder.write_run_manifest(document_path)
+            artifact_recorder.record_pages(page_records)
         regions = detect_layout(document_path, page_records)
-        regions = preprocess_regions(classify_regions(regions))
+        if artifact_recorder:
+            artifact_recorder.record_layout(page_records, regions)
+        regions = classify_regions(regions)
+        if artifact_recorder:
+            artifact_recorder.record_quality(page_records, regions)
+        regions = preprocess_regions(regions)
+        if artifact_recorder:
+            artifact_recorder.record_preprocessed(regions)
         route_entities(regions)
 
         entity_records: list[EntityRecord] = []
         for region in regions:
             page_regions = [candidate for candidate in regions if candidate.page_index == region.page_index]
-            entity, fidelity, provenance = self.rav_loop(region, page_regions, document_path)
+            trace = self.rav_loop(region, page_regions, document_path)
+            entity = trace.final_entity
+            fidelity = trace.final_fidelity
+            provenance = trace.provenance
+
+            # semantic enrichment: always run for image entities after fidelity
+            # validation so downstream RAG systems get description, extracted_text,
+            # structured_data regardless of pass/fail. no-op if no API key.
+            if region.entity_type == EntityType.IMAGE:
+                entity = enrich_image(entity, context_text=self._context_text(region, page_regions))
+                trace = trace.model_copy(update={"final_entity": entity})
+
             context = enrich_context(entity, region, page_regions)
-            entity_records.append(
-                EntityRecord(
-                    region_id=region.region_id,
-                    page_index=region.page_index,
-                    entity_type=region.entity_type,
-                    bbox=region.bbox,
-                    content=entity.content,
-                    fidelity_score=fidelity.fidelity_score,
-                    low_confidence_flag=provenance.low_confidence_flag,
-                    context=context,
-                    provenance=provenance,
-                )
+            record = EntityRecord(
+                region_id=region.region_id,
+                page_index=region.page_index,
+                entity_type=region.entity_type,
+                bbox=region.bbox,
+                content=entity.content,
+                fidelity_score=fidelity.fidelity_score,
+                low_confidence_flag=provenance.low_confidence_flag,
+                context=context,
+                provenance=provenance,
             )
+            entity_records.append(record)
+            if artifact_recorder:
+                artifact_recorder.record_trace(region, trace)
+
+        if artifact_recorder:
+            artifact_recorder.record_final_output(page_records, entity_records)
         return entity_records

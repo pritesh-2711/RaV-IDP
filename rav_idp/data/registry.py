@@ -107,12 +107,23 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         key="scanbank",
         display_name="ScanBank",
         stage="stage3b_images",
-        access=DatasetAccess.CONTACT,
-        description="Figure extraction benchmark requiring author contact.",
-        expected_artifacts=["images/", "annotations/"],
+        access=DatasetAccess.PUBLIC,
+        description=(
+            "Document figure extraction benchmark. Each row is a document page image "
+            "with COCO-style bounding box annotations for embedded figures. "
+            "Available as WKLI22/scanbank_hf on HuggingFace (MIT license). "
+            "Columns: image_id, image, width, height, objects {area, bbox, category, id}."
+        ),
+        expected_artifacts=["data/"],
         sources=[
-            DatasetSource(kind="manual", url="https://scanbank.cs.umd.edu", note="Contact authors for access."),
+            DatasetSource(
+                kind="huggingface",
+                url="https://huggingface.co/datasets/WKLI22/scanbank_hf",
+                allow_patterns=["data/*.parquet"],
+                note="MIT license. ~564 MB. Train split: 10.1K rows. Test split: 102 rows.",
+            ),
         ],
+        license_note="MIT",
     ),
     "omnidocbench": DatasetSpec(
         key="omnidocbench",

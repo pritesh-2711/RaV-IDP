@@ -63,9 +63,14 @@ class TableContent(BaseModel):
 
 class ImageContent(BaseModel):
     crop_bytes: bytes
+    # classification_label / confidence come from Docling's structural classifier
     classification_label: str | None
     classification_confidence: float | None
-    description: str | None = None
+    # fields below are populated by the image enricher after fidelity validation
+    image_type: str | None = None          # photo / chart / diagram / flowchart / logo / screenshot / table_as_image / other
+    description: str | None = None         # natural language description of the image content
+    extracted_text: str | None = None      # verbatim text visible within the image (OCR via vision model)
+    structured_data: dict | None = None    # chart: {title, axes, data_points, trend}; None for non-chart types
 
 
 class TextContent(BaseModel):
@@ -140,3 +145,18 @@ class EntityRecord(BaseModel):
     low_confidence_flag: bool
     context: ContextRecord
     provenance: ProvenanceRecord
+
+
+class PipelineTraceRecord(BaseModel):
+    region_id: str
+    entity_type: EntityType
+    primary_entity: ExtractedEntity
+    primary_reconstruction: ReconstructedOutput
+    primary_fidelity: FidelityResult
+    fallback_entity: ExtractedEntity | None = None
+    fallback_reconstruction: ReconstructedOutput | None = None
+    fallback_fidelity: FidelityResult | None = None
+    final_entity: ExtractedEntity
+    final_fidelity: FidelityResult
+    provenance: ProvenanceRecord
+    context_text: str | None = None

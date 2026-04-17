@@ -13,10 +13,13 @@ from ...models import DetectedRegion, EntityType, ExtractedEntity, ImageContent
 def extract_image(region: DetectedRegion, document_path: str | Path, scale: int = 2) -> ExtractedEntity:
     """Crop the image region from the source document."""
 
-    if region.bbox.x1 <= region.bbox.x0 or region.bbox.y1 <= region.bbox.y0:
+    path = Path(document_path)
+    if path.suffix.lower() != ".pdf":
+        crop_bytes = region.original_crop
+    elif region.bbox.x1 <= region.bbox.x0 or region.bbox.y1 <= region.bbox.y0:
         crop_bytes = b""
     else:
-        with fitz.open(str(document_path)) as doc:
+        with fitz.open(str(path)) as doc:
             page = doc[region.page_index]
             factor = DEFAULT_DPI / 72
             clip = fitz.Rect(
