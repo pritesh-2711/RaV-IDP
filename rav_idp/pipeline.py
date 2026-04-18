@@ -12,6 +12,7 @@ from .components.comparators.table import compare_table
 from .components.comparators.text import compare_text
 from .components.context_enricher import enrich_context
 from .components.entity_router import route_entities
+from .components.region_filter import suppress_text_inside_images
 from .components.extractors.image import extract_image
 from .components.extractors.table import extract_table
 from .components.extractors.text import extract_text
@@ -240,6 +241,7 @@ class RaVIDPPipeline:
         regions = preprocess_regions(regions)
         if artifact_recorder:
             artifact_recorder.record_preprocessed(regions)
+        regions, suppressed_ids = suppress_text_inside_images(regions)
         route_entities(regions)
 
         entity_records: list[EntityRecord] = []

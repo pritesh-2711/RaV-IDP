@@ -12,9 +12,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
+import re
+
 import pytesseract
 import torch
 import pandas as pd
+from apted import APTED
+from apted.helpers import Tree
+from bs4 import BeautifulSoup
 from Levenshtein import distance as lev_distance
 from PIL import Image, ImageOps
 from transformers import AutoImageProcessor, TableTransformerForObjectDetection
@@ -23,7 +28,7 @@ from ..components.comparators.table import compare_table
 from ..components.extractors.table import extract_table
 from ..components.region_preprocessor import preprocess_region
 from ..components.region_quality_classifier import classify_region
-from ..components.reconstructors.table import reconstruct_table
+from ..components.reconstructors.table import reconstruct_table, render_dataframe_to_image
 from ..config import get_settings
 from ..models import BoundingBox, DetectedRegion, EntityType
 
@@ -236,7 +241,9 @@ ANNOTATION_MEMBER_CANDIDATES = (
 class TableGroundTruth:
     filename: str
     split: str
-    row_count: int
+    row_count: int          # data rows only (excludes header rows)
+    total_row_count: int    # all rows including header rows
+    header_row_count: int   # header rows only
     col_count: int
     cell_texts: list[str]
     headers: list[str]
@@ -320,14 +327,87 @@ def _derive_ground_truth(annotation: dict) -> TableGroundTruth:
         ]
         headers = [_tokens_to_text(cell.get("tokens", [])) for cell in header_cells]
 
+    total_row_count = max(len(row_centers), 1 if ordered_cells else 0)
+    header_row_count = 1 if ordered_cells and row_centers else 0
+    data_row_count = max(0, total_row_count - header_row_count)
+
+    data_cells = [
+        cell for cell in ordered_cells
+        if _nearest_cluster(float(cell["bbox"][1]), row_centers) != header_row_index
+    ] if ordered_cells and row_centers else ordered_cells
+
     return TableGroundTruth(
         filename=str(annotation["filename"]),
         split=str(annotation["split"]),
-        row_count=max(len(row_centers), 1 if ordered_cells else 0),
+        row_count=data_row_count,
+        total_row_count=total_row_count,
+        header_row_count=header_row_count,
         col_count=max(len(col_centers), 1 if ordered_cells else 0),
-        cell_texts=[_tokens_to_text(cell.get("tokens", [])) for cell in ordered_cells],
+        cell_texts=[_tokens_to_text(cell.get("tokens", [])) for cell in data_cells],
         headers=headers,
     )
+
+
+def _gt_annotation_to_html(annotation: dict) -> str:
+    """Reconstruct a PubTabNet HTML table from its annotation dict.
+
+    Handles <td colspan="X"> / <td rowspan="Y"> style tokens by preserving
+    the opening-tag attributes and injecting cell text content.
+    """
+    structure_tokens = annotation.get("html", {}).get("structure", {}).get("tokens", [])
+    cells = annotation.get("html", {}).get("cells", [])
+    cell_iter = iter(cells)
+    html_parts = ["<table>"]
+    skip_close = False
+    for token in structure_tokens:
+        if skip_close:
+            if token == "</td>":
+                skip_close = False
+            continue
+        if token.startswith("<td"):
+            try:
+                cell = next(cell_iter)
+            except StopIteration:
+                cell = {"tokens": []}
+            content = "".join(str(t) for t in cell.get("tokens", []))
+            html_parts.append(f"{token}{content}</td>")
+            skip_close = True
+        else:
+            html_parts.append(token)
+    html_parts.append("</table>")
+    return "".join(html_parts)
+
+
+def _html_to_apted_tree(html: str) -> Tree:
+    soup = BeautifulSoup(html, "html.parser")
+
+    def _node(element) -> str:
+        if isinstance(element, str):
+            text = element.strip()
+            if not text:
+                return ""
+            text = re.sub(r"[{}]", "", text)
+            return "{" + text + "}" if text else ""
+        tag = element.name or "unknown"
+        children = "".join(_node(c) for c in element.children)
+        return "{" + tag + children + "}"
+
+    table = soup.find("table")
+    if table is None:
+        return Tree.from_text("{empty}")
+    return Tree.from_text(_node(table))
+
+
+def _compute_teds(pred_html: str, gt_html: str) -> float:
+    pred_tree = _html_to_apted_tree(pred_html)
+    gt_tree = _html_to_apted_tree(gt_html)
+    n_pred = str(pred_tree).count("{")
+    n_gt = str(gt_tree).count("{")
+    denom = max(n_pred, n_gt)
+    if denom == 0:
+        return 1.0
+    ted = APTED(pred_tree, gt_tree).compute_edit_distance()
+    return max(0.0, 1.0 - ted / denom)
 
 
 def _annotation_member(archive: tarfile.TarFile) -> tarfile.TarInfo:
@@ -448,6 +528,54 @@ def _cer(reference_items: list[str], hypothesis_items: list[str]) -> float:
     return lev_distance(hypothesis, reference) / len(reference)
 
 
+def _save_mismatch_visual(
+    record: "TableBenchmarkRecord",
+    original_bytes: bytes,
+    pred_df_json: str,
+    out_dir: Path,
+) -> None:
+    """Save a side-by-side comparison PNG for a row/col mismatch sample."""
+    from PIL import ImageDraw
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    orig = Image.open(io.BytesIO(original_bytes)).convert("RGB")
+    frame = pd.read_json(io.StringIO(pred_df_json), orient="split")
+    pred_bytes = render_dataframe_to_image(frame)
+    pred_img = Image.open(io.BytesIO(pred_bytes)).convert("RGB")
+
+    title_h = 50
+    target_h = max(orig.height, pred_img.height, 200)
+    orig_scaled = orig.resize(
+        (max(1, int(orig.width * target_h / orig.height)), target_h), Image.LANCZOS
+    )
+    pred_scaled = pred_img.resize(
+        (max(1, int(pred_img.width * target_h / pred_img.height)), target_h), Image.LANCZOS
+    )
+
+    total_w = orig_scaled.width + pred_scaled.width + 10
+    total_h = title_h + target_h
+    canvas = Image.new("RGB", (total_w, total_h), (240, 240, 240))
+    draw = ImageDraw.Draw(canvas)
+
+    row_ok = "✓" if record.row_match else "✗"
+    col_ok = "✓" if record.col_match else "✗"
+    title = (
+        f"{record.filename}  |  "
+        f"rows GT={record.ground_truth_rows} pred={record.predicted_rows} {row_ok}  |  "
+        f"cols GT={record.ground_truth_cols} pred={record.predicted_cols} {col_ok}  |  "
+        f"CER={record.cell_text_cer:.3f}"
+    )
+    draw.text((8, 10), title, fill=(30, 30, 30))
+    draw.text((8, 30), "Original crop  →  Predicted grid", fill=(80, 80, 80))
+
+    canvas.paste(orig_scaled, (0, title_h))
+    canvas.paste(pred_scaled, (orig_scaled.width + 10, title_h))
+
+    safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", record.sample_id)
+    canvas.save(out_dir / f"{safe_id}.png")
+
+
 _MIN_EVAL_DIM = 150  # Skip table crops smaller than this on the short side in evaluation.
                      # Very small images produce cell crops too tiny for reliable OCR.
                      # The production pipeline always processes all regions regardless of size.
@@ -458,6 +586,7 @@ def run_table_benchmark(
     dataset_root: str | Path,
     split: str = "test",
     limit: int | None = None,
+    mismatches_dir: Path | None = None,
 ) -> tuple[TableBenchmarkSummary, list[TableBenchmarkRecord]]:
     """Run a table-region benchmark on PubTabNet table crops."""
 
@@ -521,23 +650,25 @@ def run_table_benchmark(
         combined_gt_cells = gt.headers + gt.cell_texts
         combined_pred_cells = predicted_headers + predicted_cells
 
-        records.append(
-            TableBenchmarkRecord(
-                sample_id=sample_id,
-                filename=gt.filename,
-                ground_truth_rows=gt.row_count,
-                predicted_rows=predicted_rows,
-                ground_truth_cols=gt.col_count,
-                predicted_cols=predicted_cols,
-                ground_truth_nonempty_cells=len(gt.cell_texts),
-                predicted_nonempty_cells=len(predicted_cells),
-                row_match=gt.row_count == predicted_rows,
-                col_match=gt.col_count == predicted_cols,
-                cell_text_cer=_cer(combined_gt_cells, combined_pred_cells),
-                fidelity_score=fidelity.fidelity_score,
-                passed_threshold=fidelity.passed_threshold,
-            )
+        rec = TableBenchmarkRecord(
+            sample_id=sample_id,
+            filename=gt.filename,
+            ground_truth_rows=gt.row_count,
+            predicted_rows=predicted_rows,
+            ground_truth_cols=gt.col_count,
+            predicted_cols=predicted_cols,
+            ground_truth_nonempty_cells=len(gt.cell_texts),
+            predicted_nonempty_cells=len(predicted_cells),
+            row_match=gt.row_count == predicted_rows,
+            col_match=gt.col_count == predicted_cols,
+            cell_text_cer=_cer(combined_gt_cells, combined_pred_cells),
+            fidelity_score=fidelity.fidelity_score,
+            passed_threshold=fidelity.passed_threshold,
         )
+        records.append(rec)
+
+        if mismatches_dir is not None and (not rec.row_match or not rec.col_match):
+            _save_mismatch_visual(rec, image_bytes, entity.content.dataframe_json, mismatches_dir)
 
     if not records:
         raise ValueError(f"No PubTabNet samples found for split={split!r}.")
@@ -580,13 +711,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--save-mismatches",
+        default=None,
+        metavar="DIR",
+        help="Directory to save side-by-side comparison images for row/col mismatch samples.",
+    )
     return parser
 
 
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
-    summary, records = run_table_benchmark(args.dataset_root, split=args.split, limit=args.limit)
+    mismatches_dir = Path(args.save_mismatches) if args.save_mismatches else None
+    summary, records = run_table_benchmark(
+        args.dataset_root, split=args.split, limit=args.limit, mismatches_dir=mismatches_dir
+    )
     payload = {
         "summary": asdict(summary),
         "records": [asdict(record) for record in records],
