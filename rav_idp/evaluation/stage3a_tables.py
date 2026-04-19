@@ -477,34 +477,72 @@ def _nearest_cluster(value: float, centers: list[float]) -> int:
     return min(range(len(centers)), key=lambda idx: abs(centers[idx] - value))
 
 
+def _count_rows_from_structure(tokens: list[str]) -> tuple[int, int]:
+    """Count <tr> elements inside <thead> and <tbody> from PubTabNet structure tokens.
+
+    Returns (header_rows, data_rows).  Using the HTML structure is authoritative;
+    bbox y-clustering is unreliable when rows are closely spaced because the
+    greedy chaining groups adjacent rows into a single cluster.
+    """
+    in_thead = False
+    thead_tr = tbody_tr = 0
+    for token in tokens:
+        if token == "<thead>":
+            in_thead = True
+        elif token == "</thead>":
+            in_thead = False
+        elif token == "<tr>":
+            if in_thead:
+                thead_tr += 1
+            else:
+                tbody_tr += 1
+    return thead_tr, tbody_tr
+
+
 def _derive_ground_truth(annotation: dict) -> TableGroundTruth:
     html = annotation.get("html", {})
+    structure_tokens = html.get("structure", {}).get("tokens", [])
     cells = html.get("cells", html.get("cell", []))
     nonempty_cells = [cell for cell in cells if "bbox" in cell]
     ordered_cells = sorted(nonempty_cells, key=lambda cell: (cell["bbox"][1], cell["bbox"][0]))
 
+    # Column count: cluster x-positions of bbox cells (still reliable).
     xs = [float(cell["bbox"][0]) for cell in ordered_cells]
-    ys = [float(cell["bbox"][1]) for cell in ordered_cells]
-    row_centers = _cluster_positions(ys)
     col_centers = _cluster_positions(xs)
 
+    # Row counts: use HTML structure tokens — authoritative and immune to
+    # the chaining artefact that afflicts bbox y-clustering on tight rows.
+    header_row_count, data_row_count = _count_rows_from_structure(structure_tokens)
+    if not structure_tokens:
+        # Fallback for annotations that lack structure tokens.
+        ys = [float(cell["bbox"][1]) for cell in ordered_cells]
+        row_centers = _cluster_positions(ys)
+        total_fallback = max(len(row_centers), 1 if ordered_cells else 0)
+        header_row_count = 1 if ordered_cells and row_centers else 0
+        data_row_count = max(0, total_fallback - header_row_count)
+    total_row_count = header_row_count + data_row_count
+
+    # Header texts: first y-cluster among bbox cells.
     headers: list[str] = []
-    header_row_index = 0
-    if ordered_cells and row_centers:
-        header_cells = [
+    if ordered_cells:
+        ys = [float(cell["bbox"][1]) for cell in ordered_cells]
+        row_centers = _cluster_positions(ys)
+        if row_centers:
+            header_cells = [
+                cell for cell in ordered_cells
+                if _nearest_cluster(float(cell["bbox"][1]), row_centers) == 0
+            ]
+            headers = [_tokens_to_text(cell.get("tokens", [])) for cell in header_cells]
+
+    # Data cell texts: bbox cells not in the first y-cluster.
+    data_cells: list[dict] = []
+    if ordered_cells:
+        ys = [float(cell["bbox"][1]) for cell in ordered_cells]
+        row_centers = _cluster_positions(ys)
+        data_cells = [
             cell for cell in ordered_cells
-            if _nearest_cluster(float(cell["bbox"][1]), row_centers) == header_row_index
+            if not row_centers or _nearest_cluster(float(cell["bbox"][1]), row_centers) != 0
         ]
-        headers = [_tokens_to_text(cell.get("tokens", [])) for cell in header_cells]
-
-    total_row_count = max(len(row_centers), 1 if ordered_cells else 0)
-    header_row_count = 1 if ordered_cells and row_centers else 0
-    data_row_count = max(0, total_row_count - header_row_count)
-
-    data_cells = [
-        cell for cell in ordered_cells
-        if _nearest_cluster(float(cell["bbox"][1]), row_centers) != header_row_index
-    ] if ordered_cells and row_centers else ordered_cells
 
     return TableGroundTruth(
         filename=str(annotation["filename"]),
@@ -703,21 +741,44 @@ def _save_mismatch_visual(
     original_bytes: bytes,
     pred_df_json: str,
     out_dir: Path,
+    tatr_row_bands: list[list[float]] | None = None,
+    tatr_col_bands: list[list[float]] | None = None,
 ) -> None:
-    """Save a side-by-side comparison PNG for a row/col mismatch sample."""
+    """Save a side-by-side comparison PNG for a row/col mismatch sample.
+
+    Left panel: original crop with TATR row/col band lines overlaid (when
+    tatr_row_bands / tatr_col_bands are supplied).  This is the grid overlay
+    that makes phantom splits vs real rows immediately visible without any
+    API cost.
+
+    Right panel: extracted DataFrame rendered as a grid.
+    """
     from PIL import ImageDraw
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     orig = Image.open(io.BytesIO(original_bytes)).convert("RGB")
+
+    # Draw TATR band lines onto a copy of the original crop.
+    annotated = orig.copy()
+    if tatr_row_bands or tatr_col_bands:
+        adraw = ImageDraw.Draw(annotated)
+        ow, oh = orig.size
+        for _, (bx0, by0, bx1, by1) in (tatr_row_bands or []):
+            # Top edge of each row band
+            adraw.line([(0, int(by0)), (ow, int(by0))], fill=(255, 50, 50), width=2)
+        for _, (bx0, by0, bx1, by1) in (tatr_col_bands or []):
+            # Left edge of each col band
+            adraw.line([(int(bx0), 0), (int(bx0), oh)], fill=(50, 50, 255), width=2)
+
     frame = pd.read_json(io.StringIO(pred_df_json), orient="split")
     pred_bytes = render_dataframe_to_image(frame)
     pred_img = Image.open(io.BytesIO(pred_bytes)).convert("RGB")
 
     title_h = 50
-    target_h = max(orig.height, pred_img.height, 200)
-    orig_scaled = orig.resize(
-        (max(1, int(orig.width * target_h / orig.height)), target_h), Image.LANCZOS
+    target_h = max(annotated.height, pred_img.height, 200)
+    orig_scaled = annotated.resize(
+        (max(1, int(annotated.width * target_h / annotated.height)), target_h), Image.LANCZOS
     )
     pred_scaled = pred_img.resize(
         (max(1, int(pred_img.width * target_h / pred_img.height)), target_h), Image.LANCZOS
@@ -730,6 +791,7 @@ def _save_mismatch_visual(
 
     row_ok = "✓" if record.row_match else "✗"
     col_ok = "✓" if record.col_match else "✗"
+    overlay_note = " (red=rows blue=cols)" if (tatr_row_bands or tatr_col_bands) else ""
     title = (
         f"{record.filename}  |  "
         f"rows GT={record.ground_truth_rows} pred={record.predicted_rows} {row_ok}  |  "
@@ -737,7 +799,7 @@ def _save_mismatch_visual(
         f"CER={record.cell_text_cer:.3f}"
     )
     draw.text((8, 10), title, fill=(30, 30, 30))
-    draw.text((8, 30), "Original crop  →  Predicted grid", fill=(80, 80, 80))
+    draw.text((8, 30), f"Original crop{overlay_note}  →  Predicted grid", fill=(80, 80, 80))
 
     canvas.paste(orig_scaled, (0, title_h))
     canvas.paste(pred_scaled, (orig_scaled.width + 10, title_h))
@@ -789,6 +851,9 @@ def run_table_benchmark(
         crop_bytes = region.processed_crop or image_bytes
         is_degraded = region.quality_class == QualityClass.SCANNED_DEGRADED
 
+        tatr_row_bands: list[list[float]] | None = None
+        tatr_col_bands: list[list[float]] | None = None
+
         if is_degraded:
             # Low-quality crop: try GPT-4o first for better cell-level accuracy.
             # GPT streams rows as JSONL so long tables don't hit context limits.
@@ -810,6 +875,7 @@ def run_table_benchmark(
             # whitespace tokenisation.
             detected_cols = _tatr_col_count(tatr_record)
             table_record = tatr_record if tatr_record else _docling_table_record(crop_bytes)
+
         region = region.model_copy(update={"raw_docling_record": table_record})
         entity = extract_table(region)
         reconstruction = reconstruct_table(entity, region)

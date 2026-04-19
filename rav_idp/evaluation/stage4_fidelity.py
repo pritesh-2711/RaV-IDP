@@ -14,6 +14,7 @@ from scipy.stats import spearmanr
 class CorrelationSummary:
     num_samples: int
     spearman_rho: float
+    p_value: float
     quality_field: str
     fidelity_field: str = "fidelity_score"
 
@@ -31,10 +32,12 @@ class ThresholdSummary:
 
 @dataclass
 class Stage4Summary:
-    table_vs_gt_cer: CorrelationSummary | None
+    table_vs_cer: CorrelationSummary | None
     table_vs_teds: CorrelationSummary | None
+    image_vs_phash: CorrelationSummary | None
     text_vs_cer: CorrelationSummary | None
     table_threshold: ThresholdSummary | None
+    image_threshold: ThresholdSummary | None
     text_threshold: ThresholdSummary | None
 
 
@@ -42,13 +45,13 @@ def _load_payload(path: str | Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def _safe_spearman(xs: list[float], ys: list[float]) -> float:
-    if len(xs) < 2 or len(ys) < 2:
-        return 0.0
-    rho, _ = spearmanr(xs, ys)
-    if rho != rho:  # NaN check
-        return 0.0
-    return float(rho)
+def _safe_spearman(xs: list[float], ys: list[float]) -> tuple[float, float]:
+    if len(xs) < 3 or len(ys) < 3:
+        return 0.0, 1.0
+    rho, pval = spearmanr(xs, ys)
+    if rho != rho:  # NaN guard
+        return 0.0, 1.0
+    return float(rho), float(pval)
 
 
 def _binary_f1(predicted: list[bool], actual: list[bool]) -> tuple[float, float, float]:
@@ -97,30 +100,62 @@ def _table_correlations(
 ) -> tuple[CorrelationSummary | None, CorrelationSummary | None, ThresholdSummary | None]:
     if not records:
         return None, None, None
-    fidelity = [float(record["fidelity_score"]) for record in records]
-    gt_cer = [float(record["gt_cell_text_cer"]) for record in records]
-    teds = [float(record["teds"]) for record in records if "teds" in record]
 
+    fidelity = [float(r["fidelity_score"]) for r in records]
+    # Stage 3a uses "cell_text_cer" as the ground-truth quality signal
+    gt_cer = [float(r["cell_text_cer"]) for r in records]
+    teds = [float(r["teds"]) for r in records if "teds" in r]
+
+    rho, pval = _safe_spearman(fidelity, [-v for v in gt_cer])
     corr_cer = CorrelationSummary(
         num_samples=len(records),
-        spearman_rho=_safe_spearman(fidelity, [-value for value in gt_cer]),
-        quality_field="negative_gt_cell_text_cer",
+        spearman_rho=rho,
+        p_value=pval,
+        quality_field="negative_cell_text_cer",
     )
 
     corr_teds = None
     if len(teds) == len(records):
+        rho_t, pval_t = _safe_spearman(fidelity, teds)
         corr_teds = CorrelationSummary(
             num_samples=len(records),
-            spearman_rho=_safe_spearman(fidelity, teds),
+            spearman_rho=rho_t,
+            p_value=pval_t,
             quality_field="teds",
         )
 
     threshold = _best_threshold(
         fidelity_scores=fidelity,
-        gt_positive=[value <= cer_accept_threshold for value in gt_cer],
+        gt_positive=[v <= cer_accept_threshold for v in gt_cer],
         gt_positive_threshold=cer_accept_threshold,
     )
     return corr_cer, corr_teds, threshold
+
+
+def _image_correlations(
+    records: list[dict],
+    phash_accept_threshold: float,
+) -> tuple[CorrelationSummary | None, ThresholdSummary | None]:
+    if not records:
+        return None, None
+
+    fidelity = [float(r["fidelity_score"]) for r in records]
+    phash = [float(r["phash_similarity"]) for r in records]
+
+    rho, pval = _safe_spearman(fidelity, phash)
+    corr = CorrelationSummary(
+        num_samples=len(records),
+        spearman_rho=rho,
+        p_value=pval,
+        quality_field="phash_similarity",
+    )
+
+    threshold = _best_threshold(
+        fidelity_scores=fidelity,
+        gt_positive=[v >= phash_accept_threshold for v in phash],
+        gt_positive_threshold=phash_accept_threshold,
+    )
+    return corr, threshold
 
 
 def _text_correlations(
@@ -129,16 +164,21 @@ def _text_correlations(
 ) -> tuple[CorrelationSummary | None, ThresholdSummary | None]:
     if not records:
         return None, None
-    fidelity = [float(record["fidelity_score"]) for record in records]
-    cer = [float(record["cer"]) for record in records]
+
+    fidelity = [float(r["fidelity_score"]) for r in records]
+    cer = [float(r["cer"]) for r in records]
+
+    rho, pval = _safe_spearman(fidelity, [-v for v in cer])
     corr = CorrelationSummary(
         num_samples=len(records),
-        spearman_rho=_safe_spearman(fidelity, [-value for value in cer]),
+        spearman_rho=rho,
+        p_value=pval,
         quality_field="negative_cer",
     )
+
     threshold = _best_threshold(
         fidelity_scores=fidelity,
-        gt_positive=[value <= cer_accept_threshold for value in cer],
+        gt_positive=[v <= cer_accept_threshold for v in cer],
         gt_positive_threshold=cer_accept_threshold,
     )
     return corr, threshold
@@ -146,18 +186,28 @@ def _text_correlations(
 
 def run_stage4(
     table_artifact: str | Path | None = None,
+    image_artifact: str | Path | None = None,
     text_artifact: str | Path | None = None,
     table_cer_accept_threshold: float = 0.5,
+    image_phash_accept_threshold: float = 0.85,
     text_cer_accept_threshold: float = 0.2,
 ) -> Stage4Summary:
-    table_vs_gt_cer = table_vs_teds = table_threshold = None
+    table_vs_cer = table_vs_teds = table_threshold = None
+    image_vs_phash = image_threshold = None
     text_vs_cer = text_threshold = None
 
     if table_artifact:
         payload = _load_payload(table_artifact)
-        table_vs_gt_cer, table_vs_teds, table_threshold = _table_correlations(
+        table_vs_cer, table_vs_teds, table_threshold = _table_correlations(
             payload.get("records", []),
             cer_accept_threshold=table_cer_accept_threshold,
+        )
+
+    if image_artifact:
+        payload = _load_payload(image_artifact)
+        image_vs_phash, image_threshold = _image_correlations(
+            payload.get("records", []),
+            phash_accept_threshold=image_phash_accept_threshold,
         )
 
     if text_artifact:
@@ -168,19 +218,25 @@ def run_stage4(
         )
 
     return Stage4Summary(
-        table_vs_gt_cer=table_vs_gt_cer,
+        table_vs_cer=table_vs_cer,
         table_vs_teds=table_vs_teds,
+        image_vs_phash=image_vs_phash,
         text_vs_cer=text_vs_cer,
         table_threshold=table_threshold,
+        image_threshold=image_threshold,
         text_threshold=text_threshold,
     )
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run Stage 4 fidelity reliability study from artifact files.")
+    parser = argparse.ArgumentParser(
+        description="Run Stage 4 fidelity reliability study from Stage 3 artifact files."
+    )
     parser.add_argument("--table-artifact", default=None, help="Stage 3a artifact JSON.")
+    parser.add_argument("--image-artifact", default=None, help="Stage 3b artifact JSON.")
     parser.add_argument("--text-artifact", default=None, help="Stage 3c artifact JSON.")
     parser.add_argument("--table-cer-accept-threshold", type=float, default=0.5)
+    parser.add_argument("--image-phash-accept-threshold", type=float, default=0.85)
     parser.add_argument("--text-cer-accept-threshold", type=float, default=0.2)
     parser.add_argument("--output", default=None)
     return parser
@@ -191,8 +247,10 @@ def main() -> int:
     args = parser.parse_args()
     summary = run_stage4(
         table_artifact=args.table_artifact,
+        image_artifact=args.image_artifact,
         text_artifact=args.text_artifact,
         table_cer_accept_threshold=args.table_cer_accept_threshold,
+        image_phash_accept_threshold=args.image_phash_accept_threshold,
         text_cer_accept_threshold=args.text_cer_accept_threshold,
     )
     payload = asdict(summary)
