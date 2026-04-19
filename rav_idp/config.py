@@ -20,7 +20,8 @@ class Settings:
     """Runtime settings loaded from environment variables."""
 
     openai_api_key: str | None
-    openai_model: str
+    openai_model: str          # vision/extraction tasks (fallback extractor, image enricher)
+    openai_qa_model: str       # Stage 6 QA — text-only, cheaper model is sufficient
     openai_vision_max_tokens: int
     threshold_table: float
     threshold_image: float
@@ -48,7 +49,8 @@ def get_settings() -> Settings:
 
     return Settings(
         openai_api_key=os.getenv("OPENAI_API_KEY"),
-        openai_model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1"),
+        openai_qa_model=os.getenv("OPENAI_QA_MODEL", "gpt-4.1-mini"),
         openai_vision_max_tokens=int(os.getenv("OPENAI_VISION_MAX_TOKENS", "1024")),
         threshold_table=float(os.getenv("RAV_THRESHOLD_TABLE", "0.75")),
         threshold_image=float(os.getenv("RAV_THRESHOLD_IMAGE", "0.70")),

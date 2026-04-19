@@ -52,10 +52,22 @@ class ProcessorBundle:
     threshold: float
 
 
-class RaVIDPPipeline:
-    """End-to-end RaV-IDP pipeline."""
+PIPELINE_MODES = ("full", "gate_only", "no_rav")
 
-    def __init__(self) -> None:
+
+class RaVIDPPipeline:
+    """End-to-end RaV-IDP pipeline.
+
+    mode controls how far the RaV loop runs:
+      full      — extract → fidelity gate → GPT-4o fallback if needed (default)
+      gate_only — extract → fidelity gate → flag failures, no fallback
+      no_rav    — extract only, no fidelity gate, no fallback; every entity passes
+    """
+
+    def __init__(self, mode: str = "full") -> None:
+        if mode not in PIPELINE_MODES:
+            raise ValueError(f"mode must be one of {PIPELINE_MODES}, got {mode!r}")
+        self.mode = mode
         settings = get_settings()
         self.settings = settings
         self.bundles: dict[EntityType, ProcessorBundle] = {
@@ -113,14 +125,34 @@ class RaVIDPPipeline:
         page_regions: list[DetectedRegion],
         document_path: str | Path,
     ) -> PipelineTraceRecord:
-        """Run primary extraction and fallback when needed."""
+        """Run primary extraction; apply fidelity gate and fallback per self.mode."""
 
         bundle = self.bundles[region.entity_type]
         extra_kwargs = self._bundle_kwargs(region, page_regions, document_path)
         entity = bundle.extractor(region, **extra_kwargs["extractor"])
+
+        # no_rav: accept everything from the primary extractor unconditionally
+        if self.mode == "no_rav":
+            provenance = ProvenanceRecord(
+                region_id=region.region_id,
+                primary_fidelity=None,
+                final_extractor=entity.extractor_name,
+                final_fidelity=1.0,
+                low_confidence_flag=False,
+            )
+            return PipelineTraceRecord(
+                region_id=region.region_id,
+                entity_type=region.entity_type,
+                primary_entity=entity,
+                primary_reconstruction=None,
+                primary_fidelity=None,
+                final_entity=entity,
+                final_fidelity=None,
+                provenance=provenance,
+            )
+
         reconstruction = bundle.reconstructor(entity, region, **extra_kwargs["reconstructor"])
         fidelity = self._compare(bundle, region, entity, reconstruction, "primary")
-        context_text = None
         provenance = ProvenanceRecord(
             region_id=region.region_id,
             primary_fidelity=fidelity.fidelity_score,
@@ -129,7 +161,8 @@ class RaVIDPPipeline:
             low_confidence_flag=not fidelity.passed_threshold,
         )
 
-        if fidelity.passed_threshold:
+        # gate_only or passed threshold: return primary result, no fallback
+        if fidelity.passed_threshold or self.mode == "gate_only":
             return PipelineTraceRecord(
                 region_id=region.region_id,
                 entity_type=region.entity_type,
@@ -141,8 +174,8 @@ class RaVIDPPipeline:
                 provenance=provenance,
             )
 
+        # full: run GPT-4o fallback
         fallback_context = self._context_text(region, page_regions)
-        context_text = fallback_context
         fallback_entity = call_vision_fallback(region, context_text=fallback_context)
         fallback_reconstruction = bundle.reconstructor(
             fallback_entity,
@@ -178,7 +211,7 @@ class RaVIDPPipeline:
             final_entity=best_entity,
             final_fidelity=best_fidelity,
             provenance=provenance,
-            context_text=context_text,
+            context_text=fallback_context,
         )
 
     def _bundle_kwargs(
@@ -221,12 +254,12 @@ class RaVIDPPipeline:
         result.extractor_name = extractor_name
         return result
 
-    def run(
+    def _process_regions(
         self,
         document_path: str | Path,
         artifact_recorder: VisualArtifactRecorder | None = None,
-    ) -> list[EntityRecord]:
-        """Run the full pipeline and return final entity records."""
+    ) -> tuple[list[EntityRecord], list[PipelineTraceRecord]]:
+        """Shared region-processing core. Returns (entity_records, traces)."""
 
         page_records = render_document_pages(document_path)
         if artifact_recorder:
@@ -245,6 +278,8 @@ class RaVIDPPipeline:
         route_entities(regions)
 
         entity_records: list[EntityRecord] = []
+        traces: list[PipelineTraceRecord] = []
+
         for region in regions:
             page_regions = [candidate for candidate in regions if candidate.page_index == region.page_index]
             trace = self.rav_loop(region, page_regions, document_path)
@@ -252,9 +287,6 @@ class RaVIDPPipeline:
             fidelity = trace.final_fidelity
             provenance = trace.provenance
 
-            # semantic enrichment: always run for image entities after fidelity
-            # validation so downstream RAG systems get description, extracted_text,
-            # structured_data regardless of pass/fail. no-op if no API key.
             if region.entity_type == EntityType.IMAGE:
                 entity = enrich_image(entity, context_text=self._context_text(region, page_regions))
                 trace = trace.model_copy(update={"final_entity": entity})
@@ -266,15 +298,32 @@ class RaVIDPPipeline:
                 entity_type=region.entity_type,
                 bbox=region.bbox,
                 content=entity.content,
-                fidelity_score=fidelity.fidelity_score,
+                fidelity_score=fidelity.fidelity_score if fidelity else 1.0,
                 low_confidence_flag=provenance.low_confidence_flag,
                 context=context,
                 provenance=provenance,
             )
             entity_records.append(record)
+            traces.append(trace)
             if artifact_recorder:
                 artifact_recorder.record_trace(region, trace)
 
         if artifact_recorder:
             artifact_recorder.record_final_output(page_records, entity_records)
+        return entity_records, traces
+
+    def run(
+        self,
+        document_path: str | Path,
+        artifact_recorder: VisualArtifactRecorder | None = None,
+    ) -> list[EntityRecord]:
+        """Run the full pipeline and return final entity records."""
+        entity_records, _ = self._process_regions(document_path, artifact_recorder)
         return entity_records
+
+    def run_with_traces(
+        self,
+        document_path: str | Path,
+    ) -> tuple[list[EntityRecord], list[PipelineTraceRecord]]:
+        """Run the full pipeline and return (entity_records, traces)."""
+        return self._process_regions(document_path)

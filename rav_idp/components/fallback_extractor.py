@@ -126,7 +126,7 @@ def call_vision_fallback(region: DetectedRegion, context_text: str = "") -> Extr
     image_b64 = base64.b64encode(region.original_crop).decode("utf-8")
     entity_type = region.entity_type if region.entity_type in SYSTEM_PROMPTS else EntityType.TEXT
     response = _client().chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", settings.openai_model),
+        model=settings.openai_model,
         max_tokens=int(os.getenv("OPENAI_VISION_MAX_TOKENS", str(settings.openai_vision_max_tokens))),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPTS[entity_type]},
