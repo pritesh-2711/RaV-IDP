@@ -16,6 +16,8 @@ try:
 except ImportError:  # pragma: no cover - optional dependency in tests
     DocumentConverter = None
 
+_DOCLING_CONVERTER: DocumentConverter | None = None
+
 
 def _normalize_docling_items(document: object, attr_name: str) -> Iterable[object]:
     return getattr(document, attr_name, []) or []
@@ -33,11 +35,13 @@ def _item_type(attr_name: str) -> EntityType:
 def detect_layout(document_path: str | Path, page_records: list[PageRecord]) -> list[DetectedRegion]:
     """Detect layout elements and persist original crops."""
 
+    global _DOCLING_CONVERTER
     if DocumentConverter is None:
         return []
 
-    converter = DocumentConverter()
-    result = converter.convert(str(document_path))
+    if _DOCLING_CONVERTER is None:
+        _DOCLING_CONVERTER = DocumentConverter()
+    result = _DOCLING_CONVERTER.convert(str(document_path))
 
     path = Path(document_path)
     is_pdf = path.suffix.lower() == ".pdf"
