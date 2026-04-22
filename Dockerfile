@@ -30,16 +30,15 @@ COPY . .
 # CUDA index build when resolving torch as a transitive dependency.
 RUN pip install --upgrade pip && \
     pip install \
-        torch==2.3.1+cpu \
-        torchvision==0.18.1+cpu \
+        torch==2.4.1+cpu \
+        torchvision==0.19.1+cpu \
         --index-url https://download.pytorch.org/whl/cpu
 
 # transformers: TableTransformer (TATR) used in stage3a evaluation.
-# rapidocr: used in utils.py for OCR in comparators; not declared in pyproject.toml.
-# Both are runtime requirements that pyproject.toml currently omits.
+# rapidocr: used in utils.py for OCR in comparators.
 RUN pip install \
-    "transformers>=4.40" \
-    "rapidocr>=1.3"
+    "transformers>=4.41" \
+    "rapidocr>=3.4"
 
 # Install the project and its declared dependencies.
 RUN pip install -e ".[dev]"

@@ -1,0 +1,31 @@
+.git/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local secrets and environment files must be mounted/provided at runtime only.
+.env
+.env.*
+!.env.example
+
+# User inputs, datasets, and generated outputs are mounted by docker-compose.
+input/
+artifacts/
+data/raw/
+data/external/
+manifests/
+
+# Local development environments and caches.
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# OS/editor noise.
+.DS_Store
+.idea/
+.vscode/
