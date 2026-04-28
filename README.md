@@ -25,7 +25,8 @@ GPT fallback and image enrichment. See `DOCKER.md` for more Docker usage notes.
 
 ### Paper
 
-- arXiv: (coming soon)
+- arXiv: https://arxiv.org/abs/2604.23644
+- HF: https://huggingface.co/papers/2604.23644
 - DOI: https://doi.org/10.5281/zenodo.19694316
 
 ## License
