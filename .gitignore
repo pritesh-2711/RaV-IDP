@@ -211,5 +211,22 @@ input/*
 !input/.gitkeep
 data/raw/
 data/external/
+data/manifests/
 artifacts/
-manifests/
+
+# Model weights & checkpoints
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+models/DocRes/checkpoints/
+models/baselines/
+models/DocRes/data/
+models/DocRes/images/
+models/DocRes/input/
+models/DocRes/restorted/
+
+# Jupyter notebooks
+*.ipynb
+

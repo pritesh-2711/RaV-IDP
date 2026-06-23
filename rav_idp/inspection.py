@@ -101,7 +101,7 @@ class VisualArtifactRecorder(BaseArtifactRecorder):
                 "stages": {
                     "00_pages": "Rendered page images before layout analysis.",
                     "01_layout": "Layout detection overlays and region metadata.",
-                    "02_quality_classification": "Region-level quality labels and original crops.",
+                    "02_quality_classification": "Region quality profiles, legacy routing labels, and original crops.",
                     "03_preprocessed_regions": "Processed region crops after preprocessing.",
                     "04_rav_traces": "Primary extraction, fallback, reconstruction, and fidelity per region.",
                     "05_final_output": "Final overlays, entity records, and run summary.",
@@ -166,7 +166,11 @@ class VisualArtifactRecorder(BaseArtifactRecorder):
             page_records,
             regions,
             self.paths.quality_dir,
-            lambda region: f"{region.region_id}:{region.entity_type.value}|{(region.quality_class.value if region.quality_class else 'unknown')}",
+            lambda region: (
+                f"{region.region_id}:{region.entity_type.value}|"
+                f"{(region.quality_class.value if region.quality_class else 'unknown')}|"
+                f"qa:{(region.quality_assessment.profile.derived_label if region.quality_assessment else 'unknown')}"
+            ),
         )
         manifest = []
         for region in regions:
