@@ -19,6 +19,7 @@ from .components.extractors.text import extract_text
 from .components.fallback_extractor import call_vision_fallback
 from .components.layout_detector import detect_layout
 from .components.page_renderer import render_document_pages
+from .components.quality_profiler import profile_pages
 from .components.region_preprocessor import preprocess_regions
 from .components.region_quality_classifier import classify_regions
 from .components.reconstructors.image import reconstruct_image
@@ -261,14 +262,18 @@ class RaVIDPPipeline:
     ) -> tuple[list[EntityRecord], list[PipelineTraceRecord]]:
         """Shared region-processing core. Returns (entity_records, traces)."""
 
-        page_records = render_document_pages(document_path)
+        page_records = profile_pages(
+            render_document_pages(document_path),
+            document_path,
+            config=self.settings.quality_profiler,
+        )
         if artifact_recorder:
             artifact_recorder.write_run_manifest(document_path)
             artifact_recorder.record_pages(page_records)
         regions = detect_layout(document_path, page_records)
         if artifact_recorder:
             artifact_recorder.record_layout(page_records, regions)
-        regions = classify_regions(regions)
+        regions = classify_regions(regions, page_records)
         if artifact_recorder:
             artifact_recorder.record_quality(page_records, regions)
         regions = preprocess_regions(regions)

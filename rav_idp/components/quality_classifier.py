@@ -11,6 +11,7 @@ import numpy as np
 from ..config import DEFAULT_DPI
 from ..models import PageRecord, QualityClass
 from ..utils import has_pdf_text_layer, image_bytes_to_ndarray, render_page_to_png
+from .quality_profiler import profile_pages
 
 
 def _estimate_skew_angle(gray: np.ndarray) -> float:
@@ -47,7 +48,7 @@ def classify_document(document_path: str | Path) -> list[PageRecord]:
     path = Path(document_path)
     if path.suffix.lower() != ".pdf":
         image = Path(document_path).read_bytes()
-        return [
+        records = [
             PageRecord(
                 page_index=0,
                 quality_class=QualityClass.SCANNED_CLEAN,
@@ -56,6 +57,7 @@ def classify_document(document_path: str | Path) -> list[PageRecord]:
                 processed_image=image,
             )
         ]
+        return profile_pages(records, path)
 
     page_records: list[PageRecord] = []
     with fitz.open(path) as doc:
@@ -82,4 +84,4 @@ def classify_document(document_path: str | Path) -> list[PageRecord]:
                 )
             )
 
-    return page_records
+    return profile_pages(page_records, path)
